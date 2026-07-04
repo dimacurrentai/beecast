@@ -40,6 +40,10 @@ fn help() -> String {
      \x20 • version                   Print the version.\n\
      \x20 • help [topic]              This help, or one of: build, schema, exitcodes.\n\
      \n\
+     Global flags (any command):\n\
+     \x20   --json                    Machine output (single-key JSON); the default when stdout is not a TTY.\n\
+     \x20   --color=<auto|never|no>   Color for human output; never/no disable it, as does NO_COLOR.\n\
+     \n\
      The sidecar carries {{ title, summary, chapters }}; see SCHEMA.md. Chapters are keyed\n\
      by fractional seconds and the first one must start at 0. The generated page supports\n\
      chapter navigation, 0.5×–3× speed, and ?t=<seconds>&note=<comment> deep links.\n"
@@ -92,19 +96,60 @@ struct BuildArgs {
 struct Usage(String);
 
 fn main() -> ExitCode {
-  let args: Vec<String> = std::env::args().skip(1).collect();
-  let machine = !std::io::stdout().is_terminal();
-  match dispatch(&args, machine) {
+  let mut args: Vec<String> = std::env::args().skip(1).collect();
+  let global = match parse_global(&mut args) {
+    Ok(g) => g,
+    Err(Usage(msg)) => {
+      report_error(&msg, !std::io::stdout().is_terminal(), "usage", false);
+      return ExitCode::from(2);
+    }
+  };
+  match dispatch(&args, global.machine, global.color) {
     Ok(()) => ExitCode::SUCCESS,
     Err(Fail::Usage(msg)) => {
-      report_error(&msg, machine, "usage");
+      report_error(&msg, global.machine, "usage", global.color);
       ExitCode::from(2)
     }
     Err(Fail::Run(e)) => {
-      report_error(&format!("{e:#}"), machine, "request");
+      report_error(&format!("{e:#}"), global.machine, "request", global.color);
       ExitCode::FAILURE
     }
   }
+}
+
+/// The resolved global flags: what mode output is in, and whether stderr gets color.
+struct Global {
+  /// Machine output: `--json` given, or stdout is not a TTY (§2).
+  machine: bool,
+  /// Color human diagnostics: at a TTY, unless `NO_COLOR` or `--color=never|no` said not to.
+  color: bool,
+}
+
+/// Strip the global flags (`--json`, `--color=<mode>`) out of the argument list, leaving
+/// the command and its own flags for `dispatch`.
+fn parse_global(args: &mut Vec<String>) -> Result<Global, Usage> {
+  let mut json = false;
+  let mut color_off = false;
+  let mut rest = Vec::with_capacity(args.len());
+  for a in args.drain(..) {
+    if a == "--json" {
+      json = true;
+    } else if let Some(mode) = a.strip_prefix("--color=") {
+      match mode {
+        "auto" => color_off = false,
+        "never" | "no" => color_off = true,
+        other => return Err(Usage(format!("unknown --color mode `{other}` (supported: auto, never, no)"))),
+      }
+    } else if a == "--color" {
+      return Err(Usage("--color needs a mode: --color=<auto|never|no>".into()));
+    } else {
+      rest.push(a);
+    }
+  }
+  *args = rest;
+  let machine = json || !std::io::stdout().is_terminal();
+  let color = !color_off && std::env::var_os("NO_COLOR").is_none() && std::io::stderr().is_terminal();
+  Ok(Global { machine, color })
 }
 
 /// The two failure planes, kept apart so `main` can map them to exit codes 2 and 1.
@@ -124,7 +169,7 @@ impl From<anyhow::Error> for Fail {
   }
 }
 
-fn dispatch(args: &[String], machine: bool) -> Result<(), Fail> {
+fn dispatch(args: &[String], machine: bool, color: bool) -> Result<(), Fail> {
   let first = args.first().map(String::as_str);
   match first {
     None | Some("help") | Some("--help") | Some("-h") => {
@@ -146,8 +191,10 @@ fn dispatch(args: &[String], machine: bool) -> Result<(), Fail> {
       Ok(())
     }
     Some("schema") => {
-      // Data → stdout, verbatim: the schema file itself is the machine-readable output.
-      print!("{}", meta::JSON_SCHEMA);
+      // Data → stdout, generated live from the Rust types (§1): this command IS the
+      // codegen script — `beecast schema > schema/beecast-meta.schema.json` regenerates
+      // the shipped file, and a unit test pins the two byte-for-byte.
+      emit(&meta::generated_schema());
       Ok(())
     }
     Some("build") => Ok(run_build(parse_build_args(&args[1..])?, machine)?),
@@ -159,7 +206,6 @@ fn dispatch(args: &[String], machine: bool) -> Result<(), Fail> {
         return Err(Usage(format!("canonical syntax required for machines: beecast build {castish} [...]")).into());
       }
       // A nudge, not a warning: dim/grey when color is on (§2), so it reads as a hint.
-      let color = std::env::var_os("NO_COLOR").is_none() && std::io::stderr().is_terminal();
       if color {
         eprintln!("\x1b[2mnote: resolved to the canonical `beecast build {castish}`\x1b[0m");
       } else {
@@ -305,15 +351,14 @@ fn json_doc(variant: &str, payload: serde_json::Value) -> String {
   serde_json::to_string_pretty(&serde_json::json!({ variant: payload })).expect("json_doc serializes")
 }
 
-/// Errors mirror regular output: plain text (colored at a TTY unless NO_COLOR) on stderr
-/// for humans, `{ "Error": { message, stage } }` on stdout for machines — a harness always
-/// sees clean JSON on the data stream. `stage` (`"usage"` | `"request"`) mirrors the exit
-/// code so scripts branch without decoding prose.
-fn report_error(message: &str, machine: bool, stage: &str) {
+/// Errors mirror regular output: plain text (colored per the resolved `--color`/`NO_COLOR`
+/// mode) on stderr for humans, `{ "Error": { message, stage } }` on stdout for machines —
+/// a harness always sees clean JSON on the data stream. `stage` (`"usage"` | `"request"`)
+/// mirrors the exit code so scripts branch without decoding prose.
+fn report_error(message: &str, machine: bool, stage: &str, color: bool) {
   if machine {
     emit(&format!("{}\n", json_doc("Error", serde_json::json!({ "message": message, "stage": stage }))));
   } else {
-    let color = std::env::var_os("NO_COLOR").is_none() && std::io::stderr().is_terminal();
     if color {
       eprintln!("\x1b[1;31merror:\x1b[0m {message}");
     } else {

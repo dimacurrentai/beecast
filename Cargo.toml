@@ -24,3 +24,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 anyhow = "1"
+
+# The JSON Schema is generated from the Rust types (§1), never hand-written.
+# `schemars` turns the very structs serde deserializes, doc comments included, into the schema, and a unit test pins the shipped file byte-for-byte to that output.
+schemars = "1"

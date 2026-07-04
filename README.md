@@ -57,8 +57,10 @@ beecast version
 
 - `--meta` defaults to `<recording>.meta.json` when that file exists.
 - `-o -` writes the HTML to stdout (data on stdout, diagnostics on stderr — always).
-- Human at a TTY gets human-readable output; piped/captured invocations get a two-space-indented single-key JSON document with a request-specific variant: `{ "Built": { output, bytes, cast_version, chapters, meta, warnings } }`, `{ "Version": { … } }`, and on failure `{ "Error": { message, stage } }` where `stage` is `usage` or `request`. Warnings land on stderr *and* in the JSON.
+- Human at a TTY gets human-readable output; `--json` (or a piped/captured stdout) gets a two-space-indented single-key JSON document with a request-specific variant: `{ "Built": { output, bytes, cast_version, chapters, meta, warnings } }`, `{ "Version": { … } }`, and on failure `{ "Error": { message, stage } }` where `stage` is `usage` or `request`. Warnings land on stderr *and* in the JSON.
 - Exit codes: `0` success, `1` failure, `2` usage, `130` interrupted. `beecast help exitcodes` prints the table; a broken pipe ends the program quietly.
+- Color at a TTY by default; `--color=never`, `--color=no`, or `NO_COLOR` turn it off.
+- `beecast schema` is also the codegen script: the shipped schema file is its output, generated from the Rust types and pinned by tests.
 
 ## Not this tool's job
 
