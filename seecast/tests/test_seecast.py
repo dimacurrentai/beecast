@@ -153,6 +153,23 @@ class Annotate(unittest.TestCase):
                 seecast.annotate(cast, run=bad_stub)
 
 
+class SchemaMirror(unittest.TestCase):
+    """`validate_meta` is a hand-written mirror of the Rust types (the §1 source of truth;
+    the schema file is codegen'd from them by `beecast schema`). This cross-check pins the
+    facts the mirror relies on, so drift dies in this gate rather than at annotate time."""
+
+    def test_generated_schema_agrees_with_the_mirror(self):
+        path = os.path.join(os.path.dirname(__file__), "..", "..", "schema", "beecast-meta.schema.json")
+        with open(path, encoding="utf-8") as f:
+            schema = json.load(f)
+        self.assertIs(schema["additionalProperties"], False, "unknown top-level keys are rejected")
+        self.assertEqual(set(schema["properties"]), {"title", "summary", "chapters"})
+        chapter = schema["properties"]["chapters"]["items"]
+        self.assertIs(chapter["additionalProperties"], False, "unknown chapter keys are rejected")
+        self.assertEqual(set(chapter["required"]), {"t", "title"})
+        self.assertEqual(chapter["properties"]["t"]["minimum"], 0.0)
+
+
 class CliContract(unittest.TestCase):
     """The §2 machine-mode contract. `io.StringIO` is not a TTY, so redirecting stdout puts
     `main` in machine mode; the SIGPIPE path needs a real process and gets a subprocess."""
@@ -172,6 +189,13 @@ class CliContract(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(json.loads(out), {"Version": {"version": seecast.VERSION}})
         self.assertEqual(err, "", "machine-mode stderr stays quiet")
+
+    def test_json_and_color_flags_are_accepted(self):
+        # `--json` forces machine mode (redundant here, since a captured stdout already is);
+        # `--color=never` parses and cannot break machine output.
+        code, out, err = self.run_main(["--json", "--color=never", "--version"])
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(out), {"Version": {"version": seecast.VERSION}})
 
     def test_usage_error_is_stage_usage_json_with_exit_2(self):
         code, out, err = self.run_main([])

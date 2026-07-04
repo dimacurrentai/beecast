@@ -12,11 +12,12 @@ so it must run anywhere python3 exists. Tested by seecast/tests/test_seecast.py
 model, and the CLI contract); the cursor-agent path is exercised for real by running it
 on an actual recording.
 
-CLI contract (ENG-PRINCIPLES paragraph 2): data -> stdout, diagnostics -> stderr. When stdout
-is not a TTY the result is a two-space-indented single-key JSON document with a
-request-specific variant -- `{ "Annotated": ... }`, `{ "Valid": ... }`, `{ "Version": ... }`,
-or `{ "Error": { message, stage } }` where `stage` is `usage` or `request` -- except in the
-explicit stream modes (`--transcript`, `-o -`), where the document itself is the data.
+CLI contract (ENG-PRINCIPLES paragraph 2): data -> stdout, diagnostics -> stderr. In machine
+mode (`--json`, or stdout is not a TTY) the result is a two-space-indented single-key JSON
+document with a request-specific variant -- `{ "Annotated": ... }`, `{ "Valid": ... }`,
+`{ "Version": ... }`, or `{ "Error": { message, stage } }` where `stage` is `usage` or
+`request` -- except in the explicit stream modes (`--transcript`, `-o -`), where the
+document itself is the data. Color obeys `--color=never|no` and `NO_COLOR`.
 Exit codes: 0 ok, 1 failure, 2 usage, 130 interrupted (Ctrl+C); a broken pipe ends the
 program quietly. External-call discipline (paragraph 9): a liveness tick on stderr every
 ~10 seconds while cursor-agent runs, and a hard watchdog (default 180 s) kills it.
@@ -250,16 +251,20 @@ def annotate(cast_path, model=DEFAULT_MODEL, timeout=DEFAULT_TIMEOUT, run=run_cu
     return validate_meta(extract_json(reply), generated=True)
 
 
-def fail(message, code=1, stage="request"):
-    """Report an error per the house CLI rules and exit: human text on stderr at a TTY, a
-    single-key `{ "Error": { message, stage } }` JSON document on stdout otherwise. `stage`
-    (`usage` | `request`) mirrors the exit code so scripts branch without decoding prose."""
-    if sys.stdout.isatty():
-        color = os.environ.get("NO_COLOR") is None and sys.stderr.isatty()
-        prefix = "\x1b[1;31merror:\x1b[0m" if color else "error:"
-        print("%s %s" % (prefix, message), file=sys.stderr)
-    else:
+def fail(message, code=1, stage="request", machine=None, color="auto"):
+    """Report an error per the house CLI rules and exit: human text on stderr in human
+    mode, a single-key `{ "Error": { message, stage } }` JSON document on stdout in
+    machine mode (`--json`, or stdout is not a TTY — the default of None re-derives the
+    latter for callers that fail before flags are parsed). `stage` (`usage` | `request`)
+    mirrors the exit code so scripts branch without decoding prose."""
+    if machine is None:
+        machine = not sys.stdout.isatty()
+    if machine:
         print(json.dumps({"Error": {"message": message, "stage": stage}}, indent=2))
+    else:
+        colored = color not in ("never", "no") and os.environ.get("NO_COLOR") is None and sys.stderr.isatty()
+        prefix = "\x1b[1;31merror:\x1b[0m" if colored else "error:"
+        print("%s %s" % (prefix, message), file=sys.stderr)
     sys.exit(code)
 
 
@@ -275,9 +280,11 @@ class Parser(argparse.ArgumentParser):
     (stock argparse prints bare prose to stderr in both modes)."""
 
     def error(self, message):
-        if sys.stdout.isatty():
+        # Flags are not parsed yet when argparse errors, so `--json` is sniffed raw.
+        machine = "--json" in sys.argv[1:] or not sys.stdout.isatty()
+        if not machine:
             self.print_usage(sys.stderr)
-        fail(message, code=2, stage="usage")
+        fail(message, code=2, stage="usage", machine=machine)
 
 
 def main(argv=None):
@@ -291,6 +298,15 @@ def main(argv=None):
     )
     parser.add_argument("cast", nargs="?", help="the .cast recording (asciicast v2 or v3)")
     parser.add_argument("--version", action="store_true", help="print the version and exit (works offline)")
+    parser.add_argument(
+        "--json", action="store_true", help="machine output (single-key JSON); the default when stdout is not a TTY"
+    )
+    parser.add_argument(
+        "--color",
+        choices=("auto", "never", "no"),
+        default="auto",
+        help="color for human output; never/no disable it, as does NO_COLOR (default: %(default)s)",
+    )
     parser.add_argument("-o", "--output", help="sidecar path; default: <recording>.meta.json ('-' = stdout only)")
     parser.add_argument("--model", default=DEFAULT_MODEL, help="cursor-agent model (default: %(default)s)")
     parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT, help="watchdog seconds (default: %(default)s)")
@@ -299,7 +315,7 @@ def main(argv=None):
     )
     parser.add_argument("--validate", metavar="META_JSON", help="validate a sidecar file against the schema and stop")
     args = parser.parse_args(argv)
-    machine = not sys.stdout.isatty()
+    machine = args.json or not sys.stdout.isatty()
 
     if args.version:
         if machine:
@@ -313,7 +329,7 @@ def main(argv=None):
             with open(args.validate, "r", encoding="utf-8") as f:
                 validate_meta(json.load(f))
         except (OSError, ValueError) as e:
-            fail("invalid metadata in `%s`: %s" % (args.validate, e))
+            fail("invalid metadata in `%s`: %s" % (args.validate, e), machine=machine, color=args.color)
         if machine:
             emit("Valid", {"path": args.validate})
         else:
@@ -330,7 +346,7 @@ def main(argv=None):
             return
         meta = annotate(args.cast, model=args.model, timeout=args.timeout)
     except (OSError, ValueError, RuntimeError) as e:
-        fail(str(e))
+        fail(str(e), machine=machine, color=args.color)
     sidecar_json = json.dumps(meta, indent=2, ensure_ascii=False) + "\n"
     if args.output == "-":
         # Explicit stream mode: the sidecar itself is the data, no envelope; the exit

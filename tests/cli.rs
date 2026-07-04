@@ -162,3 +162,31 @@ fn help_and_version_work() {
   assert_eq!(v["Version"]["version"], env!("CARGO_PKG_VERSION"));
   let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn global_json_and_color_flags_are_accepted_anywhere() {
+  let dir = tempdir("global");
+  // `--json` forces machine mode (redundant on a pipe, but must parse in any position);
+  // `--color=never` parses; a bogus mode is a usage error with the documented remedy.
+  let out = beecast(&["--json", "version", "--color=never"], &dir);
+  assert!(out.status.success());
+  let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+  assert_eq!(v["Version"]["version"], env!("CARGO_PKG_VERSION"));
+  let bad = beecast(&["--color=rainbow", "version"], &dir);
+  assert_eq!(bad.status.code(), Some(2));
+  let e: serde_json::Value = serde_json::from_slice(&bad.stdout).unwrap();
+  assert!(e["Error"]["message"].as_str().unwrap().contains("supported: auto, never, no"));
+  let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `beecast schema` is the codegen script (§1): its output must be exactly the shipped
+/// schema file, which the unit test in `meta.rs` pins to the generated document.
+#[test]
+fn schema_command_matches_the_shipped_file() {
+  let dir = tempdir("schemagen");
+  let out = beecast(&["schema"], &dir);
+  assert!(out.status.success());
+  let shipped = std::fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join("schema/beecast-meta.schema.json")).unwrap();
+  assert_eq!(out.stdout, shipped, "run `cargo run -q -- schema > schema/beecast-meta.schema.json`");
+  let _ = std::fs::remove_dir_all(&dir);
+}

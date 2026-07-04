@@ -1,27 +1,37 @@
 //! The cast metadata sidecar: `{ title, summary, chapters }`.
 //!
 //! These Rust types are the source of truth for the sidecar's shape (ENG-PRINCIPLES §1).
-//! `schema/beecast-meta.schema.json` is the formal JSON Schema rendering and `SCHEMA.md`
-//! the human-readable one; a unit test below keeps the schema file in sync with what this
-//! module actually accepts. Parsing is strict — an unknown key is a hard, loud error.
+//! `schema/beecast-meta.schema.json` is the formal JSON Schema rendering — *generated*
+//! from these types by [`generated_schema`] (doc comments become descriptions) and pinned
+//! byte-for-byte by a unit test below; regenerate with
+//! `cargo run -q -- schema > schema/beecast-meta.schema.json`. `SCHEMA.md` is the
+//! human-readable rendering. Parsing is strict — an unknown key is a hard, loud error.
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-/// The formal JSON Schema for [`CastMeta`], embedded so `beecast schema` works offline
-/// and so tests can assert the shipped schema matches the Rust validator.
+/// The shipped JSON Schema file, embedded only to pin it byte-for-byte to
+/// [`generated_schema`] (the `shipped_schema_is_the_generated_one` test). The CLI itself
+/// prints the generated document, so the binary never depends on this file at runtime.
+#[cfg(test)]
 pub const JSON_SCHEMA: &str = include_str!("../schema/beecast-meta.schema.json");
 
 /// Sidecar metadata for one `.cast` recording, conventionally stored next to it as
 /// `<name>.meta.json`. Every field is optional: a bare recording plays fine without any.
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+/// Two invariants live beyond JSON Schema, in the beecast/seecast validators: chapters
+/// are STRICTLY ascending by `t`, and a non-empty chapter list MUST start at `t` = 0.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+#[schemars(title = "Cast metadata sidecar")]
 pub struct CastMeta {
   /// Short human title for the recording; becomes the page's `<title>` and header.
   /// Absent → the page falls back to the recording's filename.
   #[serde(default, skip_serializing_if = "Option::is_none")]
+  #[schemars(length(min = 1))]
   pub title: Option<String>,
   /// One- or two-sentence description of what the recording shows, rendered under the title.
   #[serde(default, skip_serializing_if = "Option::is_none")]
+  #[schemars(length(min = 1))]
   pub summary: Option<String>,
   /// Chapter markers, strictly ascending by `t`. When non-empty, the first chapter MUST
   /// start at `t: 0` (YouTube-style: the opening segment always has a marker).
@@ -30,14 +40,26 @@ pub struct CastMeta {
 }
 
 /// One chapter marker.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Chapter {
   /// The timekey: seconds into the recording. Fractional values are allowed (`12.5`);
   /// the first chapter's `t` must be exactly `0`.
+  #[schemars(range(min = 0.0))]
   pub t: f64,
   /// Short chapter title; 3–6 words works best.
+  #[schemars(length(min = 1))]
   pub title: String,
+}
+
+/// Render the JSON Schema from the Rust types themselves — the §1 codegen path. Chapter
+/// is inlined (no `$defs`) so the document reads top-down, like the hand of a human.
+pub fn generated_schema() -> String {
+  let generator = schemars::generate::SchemaSettings::default().with(|s| s.inline_subschemas = true).into_generator();
+  let schema = generator.into_root_schema_for::<CastMeta>();
+  let mut out = serde_json::to_string_pretty(&schema).expect("the schema serializes: it is a plain JSON value");
+  out.push('\n');
+  out
 }
 
 /// Everything that can be wrong with a structurally-valid sidecar. JSON syntax and
@@ -143,12 +165,21 @@ mod tests {
     assert_eq!(blank_chapter.validate(), Err(MetaError::EmptyChapterTitle { index: 0 }));
   }
 
-  /// The shipped JSON Schema is the *rendering* of these Rust types (§1) — keep the two
-  /// from drifting: it must parse, describe the same three properties, stay strict, and
-  /// state the fractional-seconds / starts-at-zero timekey contract.
+  /// The shipped schema file IS the codegen output (§1): byte-for-byte. When this fails,
+  /// the types changed — regenerate with `cargo run -q -- schema > schema/beecast-meta.schema.json`.
   #[test]
-  fn shipped_schema_matches_the_types() {
-    let s: serde_json::Value = serde_json::from_str(JSON_SCHEMA).unwrap();
+  fn shipped_schema_is_the_generated_one() {
+    assert_eq!(
+      JSON_SCHEMA,
+      generated_schema(),
+      "schema/beecast-meta.schema.json is stale; regenerate it from the Rust types"
+    );
+  }
+
+  /// Sanity on the generated document itself: strict, complete, and self-describing.
+  #[test]
+  fn generated_schema_is_strict_and_documented() {
+    let s: serde_json::Value = serde_json::from_str(&generated_schema()).unwrap();
     assert_eq!(s["additionalProperties"], serde_json::Value::Bool(false));
     let props = s["properties"].as_object().unwrap();
     let mut keys: Vec<_> = props.keys().collect();
@@ -159,6 +190,8 @@ mod tests {
     assert_eq!(chapter["required"], serde_json::json!(["t", "title"]));
     let t_desc = chapter["properties"]["t"]["description"].as_str().unwrap();
     assert!(t_desc.contains("seconds") && t_desc.contains("Fractional"), "got: {t_desc}");
-    assert!(t_desc.contains("MUST be exactly 0"), "got: {t_desc}");
+    for (name, prop) in props {
+      assert!(prop["description"].is_string(), "field `{name}` lost its doc comment");
+    }
   }
 }

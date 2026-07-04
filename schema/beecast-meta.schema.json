@@ -1,41 +1,51 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "beecast-meta.schema.json",
   "title": "Cast metadata sidecar",
-  "description": "Sidecar metadata for an asciinema .cast recording: title, summary, and chapters. Conventionally stored next to the recording as <name>.meta.json. Two invariants are beyond JSON Schema and are enforced by the beecast/seecast validators: chapters are STRICTLY ascending by `t`, and when chapters are present the first one MUST have `t` exactly 0.",
+  "description": "Sidecar metadata for one `.cast` recording, conventionally stored next to it as\n`<name>.meta.json`. Every field is optional: a bare recording plays fine without any.\nTwo invariants live beyond JSON Schema, in the beecast/seecast validators: chapters\nare STRICTLY ascending by `t`, and a non-empty chapter list MUST start at `t` = 0.",
   "type": "object",
-  "additionalProperties": false,
   "properties": {
-    "title": {
-      "type": "string",
-      "minLength": 1,
-      "description": "Short human title for the recording; shown as the page title and header. Omit the field rather than passing an empty string."
-    },
-    "summary": {
-      "type": "string",
-      "minLength": 1,
-      "description": "One- or two-sentence description of what the recording shows; rendered under the title."
-    },
     "chapters": {
+      "description": "Chapter markers, strictly ascending by `t`. When non-empty, the first chapter MUST\nstart at `t: 0` (YouTube-style: the opening segment always has a marker).",
       "type": "array",
-      "description": "Chapter markers, strictly ascending by `t`. When non-empty, the first chapter MUST start at t = 0 so the opening segment always has a marker.",
       "items": {
+        "description": "One chapter marker.",
         "type": "object",
-        "additionalProperties": false,
-        "required": ["t", "title"],
         "properties": {
           "t": {
+            "description": "The timekey: seconds into the recording. Fractional values are allowed (`12.5`);\nthe first chapter's `t` must be exactly `0`.",
             "type": "number",
-            "minimum": 0,
-            "description": "The timekey: seconds into the recording. Fractional values are allowed (e.g. 12.5). The first chapter's timekey MUST be exactly 0."
+            "format": "double",
+            "minimum": 0.0
           },
           "title": {
+            "description": "Short chapter title; 3–6 words works best.",
             "type": "string",
-            "minLength": 1,
-            "description": "Short chapter title; 3-6 words works best."
+            "minLength": 1
           }
-        }
+        },
+        "additionalProperties": false,
+        "required": [
+          "t",
+          "title"
+        ]
       }
+    },
+    "summary": {
+      "description": "One- or two-sentence description of what the recording shows, rendered under the title.",
+      "type": [
+        "string",
+        "null"
+      ],
+      "minLength": 1
+    },
+    "title": {
+      "description": "Short human title for the recording; becomes the page's `<title>` and header.\nAbsent → the page falls back to the recording's filename.",
+      "type": [
+        "string",
+        "null"
+      ],
+      "minLength": 1
     }
-  }
+  },
+  "additionalProperties": false
 }
