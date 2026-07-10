@@ -246,9 +246,11 @@ fn fnv1a(bytes: &[u8]) -> u64 {
 /// two embeddings), then in-band "m" markers started becoming chapter ticks, then the 0.4.0
 /// footer stamp of that minor bump (a new crate and a new API), then the 0.4.1 stamp of the
 /// release-automation patch, then 0.4.2 when fullscreen moved INTO the player (the ⛶ bar
-/// button + the `f` key, fullscreening `fullscreenEl` or the player itself). When the
-/// template, the player, or the workspace version changes *intentionally*, re-pin using the
-/// lengths and fingerprints this assertion prints.
+/// button + the `f` key, fullscreening `fullscreenEl` or the player itself), then the
+/// frontend platform work (headless `BeeCastController`, Web Component, consolidated page
+/// UI without duplicate speed/chapter chrome, semantic theme tokens, richer markers). When
+/// the template, the player, or the workspace version changes *intentionally*, re-pin using
+/// the lengths and fingerprints this assertion prints.
 #[test]
 fn generated_page_is_byte_identical_to_the_serde_era_renderer() {
   let dir = tempdir("pin");
@@ -259,7 +261,7 @@ fn generated_page_is_byte_identical_to_the_serde_era_renderer() {
   std::fs::copy(fixture("sample.cast"), dir.join("bare.cast")).unwrap();
   let bare = beecast(&["build", "bare.cast", "-o", "-"], &dir).stdout;
   let got = (with_meta.len(), fnv1a(&with_meta), bare.len(), fnv1a(&bare));
-  assert_eq!(got, (60572, 0x928a5b755563bb05, 60362, 0xba6fa49347694b98), "the generated page's bytes moved");
+  assert_eq!(got, (90602, 0xbf81d06e2b29efc2, 90392, 0x5e8fd9e1b8d39f87), "the generated page's bytes moved");
 }
 
 /// `beecast schema` is the codegen script (§1): its output must be exactly the schema file

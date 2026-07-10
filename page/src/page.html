@@ -15,34 +15,37 @@
    down at #player resolve to content height and the terminal renders 0-sized. */
 body { margin: 0; background: #121317; color: #d7d9df; font: 14px/1.5 system-ui, sans-serif;
   height: 100vh; display: flex; flex-direction: column; }
-header { padding: 14px 16px 4px; }
+header { padding: 14px 16px 4px; flex: 0 0 auto; }
 header h1 { margin: 0; font-size: 18px; }
 #summary { margin: 6px 0 0; color: #a7abb6; max-width: 84ch; }
 #summary[hidden] { display: none; }
-.controls { padding: 10px 16px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
-.controls .sep { color: #3a3d46; }
-.controls button { color: #7ab4ff; background: none; border: 1px solid #2a2d36; border-radius: 6px;
+.share { padding: 10px 16px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; flex: 0 0 auto; }
+.share button { color: #7ab4ff; background: none; border: 1px solid #2a2d36; border-radius: 6px;
   padding: 4px 10px; font: inherit; cursor: pointer; }
-.controls button:hover { border-color: #7ab4ff; }
-.controls button.active { border-color: #7ab4ff; color: #fff; background: #1d2a3d; }
+.share button:hover { border-color: #7ab4ff; }
+.share button:focus-visible { outline: 2px solid #7ab4ff; outline-offset: 2px; }
 #note { background: #1d1f26; border: 1px solid #2a2d36; border-radius: 6px; color: #d7d9df;
   font: inherit; padding: 4px 8px; width: 28ch; }
+#note:focus-visible { outline: 2px solid #7ab4ff; outline-offset: 1px; }
 .dim { color: #8a8d97; }
 .dim code { background: #1d1f26; padding: 1px 5px; border-radius: 4px; }
-#copied { color: #7dd87d; visibility: hidden; }
+#copied { color: #7dd87d; }
+#copied[hidden] { display: none; }
 #note-banner { margin: 0 16px 10px; padding: 8px 12px; border: 1px solid #6b5d2a; background: #2a2410;
-  border-radius: 6px; color: #ffd97a; max-width: 100ch; }
+  border-radius: 6px; color: #ffd97a; max-width: 100ch; flex: 0 0 auto; }
 #note-banner[hidden] { display: none; }
 #note-banner .at { color: #b9a24e; margin-right: 8px; font-variant-numeric: tabular-nums; }
-#chapters { padding: 0 16px 10px; display: flex; flex-wrap: wrap; gap: 6px; }
-#chapters button { font: inherit; font-size: 12px; color: #ccd; background: #1d1f26;
-  border: 1px solid #2a2d36; border-radius: 5px; padding: 2px 8px; cursor: pointer; }
-#chapters button:hover { border-color: #7ab4ff; color: #fff; }
-#chapters button .t { color: #7ab4ff; margin-right: 5px; font-variant-numeric: tabular-nums; }
-/* Fill the viewport below the header/controls so fit:'both' fits vertically too. */
-#player-wrap { flex: 1; padding: 0 16px 10px; min-height: 300px; }
-#player, .beecast-player { width: 100%; height: 100%; max-width: 100%; }
-footer { padding: 0 16px 12px; font-size: 12px; color: #6c7080; }
+/* Player is primary: fills remaining viewport. Chapters live inside the player. */
+#player-wrap { flex: 1 1 auto; padding: 0 16px 10px; min-height: 0; display: flex; flex-direction: column; }
+#player, .beecast-player, beecast-player { width: 100%; height: 100%; max-width: 100%; min-height: 0; }
+footer { padding: 0 16px 12px; font-size: 12px; color: #6c7080; flex: 0 0 auto; }
+@media (max-height: 420px) {
+  header { padding: 8px 12px 2px; }
+  header h1 { font-size: 15px; }
+  .share { padding: 6px 12px; }
+  #player-wrap { padding: 0 12px 6px; }
+  footer { padding: 0 12px 8px; }
+}
 </style>
 </head>
 <body>
@@ -50,20 +53,14 @@ footer { padding: 0 16px 12px; font-size: 12px; color: #6c7080; }
 <h1>@@BEECAST_TITLE@@</h1>
 <p id="summary"@@BEECAST_SUMMARY_HIDDEN@@>@@BEECAST_SUMMARY@@</p>
 </header>
-<div class="controls">
-<span class="dim">speed</span>
-<button data-speed="0.5">0.5×</button>
-<button data-speed="1" class="active">1×</button>
-<button data-speed="1.5">1.5×</button>
-<button data-speed="2">2×</button>
-<button data-speed="3">3×</button>
-<span class="sep">·</span>
-<input id="note" placeholder="optional comment for the link">
-<button id="copy-t">🔗 copy link at current time</button><span id="copied">copied</span>
+<div class="share">
+<label class="dim" for="note">note</label>
+<input id="note" type="text" placeholder="optional comment for the link" autocomplete="off">
+<button id="copy-t" type="button">🔗 copy link at current time</button>
+<span id="copied" role="status" aria-live="polite" hidden>copied</span>
 <span class="dim">deep link: <code>?t=90</code> / <code>?t=1:30&amp;note=…</code></span>
 </div>
 <div id="note-banner" hidden></div>
-<div id="chapters"></div>
 <div id="player-wrap"><div id="player"></div></div>
 <footer>@@BEECAST_FOOTER@@ — a single self-contained file: save this page and it keeps working offline.</footer>
 <script>
@@ -77,6 +74,7 @@ const META = @@BEECAST_META_JSON@@;
 (function () {
   const $ = (id) => document.getElementById(id);
   const chapters = META.chapters || [];
+  // Tuples remain supported; the player normalizes them to TimelineMarker objects.
   const MARKERS = chapters.map((c) => [c.t, c.title]);
 
   // "93.5" | "1:33.5" | "1:02:03" -> seconds; null when malformed.
@@ -98,72 +96,42 @@ const META = @@BEECAST_META_JSON@@;
   const linkT = parseT(params.get('t'));
   const linkNote = params.get('note');
 
-  let player = null;
-  let speed = 1;
-
-  // Speed changes (and reloads) recreate the player in place, parked or playing at the
-  // same moment; a deep-linked start parks on that frame (the player renders it eagerly).
-  function create(startAt, autoPlay) {
-    if (player) { try { player.dispose(); } catch (e) {} player = null; }
-    const opts = { fit: 'both', markers: MARKERS, speed: speed, idleTimeLimit: 2 };
-    if (startAt != null && startAt > 0) opts.startAt = startAt;
-    if (autoPlay) opts.autoPlay = true;
-    player = BeeCastPlayer.create({ data: CAST_DATA }, $('player'), opts);
-  }
-
-  document.querySelectorAll('[data-speed]').forEach((b) => {
-    b.addEventListener('click', () => {
-      speed = Number(b.dataset.speed);
-      document.querySelectorAll('[data-speed]').forEach((x) => x.classList.toggle('active', x === b));
-      const resume = !!(player && player.playing);
-      Promise.resolve(player ? player.getCurrentTime() : 0).then((t) => create(t, resume));
-    });
-  });
-
-  const cbar = $('chapters');
-  chapters.forEach((c) => {
-    const b = document.createElement('button');
-    const t = document.createElement('span');
-    t.className = 't';
-    t.textContent = fmtClock(c.t);
-    b.appendChild(t);
-    b.appendChild(document.createTextNode(c.title));
-    b.addEventListener('click', () => {
-      if (player) Promise.resolve(player.seek(c.t)).then(() => player.play());
-    });
-    cbar.appendChild(b);
-  });
+  // One player owns play/pause/seek/speed/chapters/fullscreen. Speed changes call
+  // setSpeed() in place — no remount, so focus and subscriptions survive.
+  const opts = { fit: 'both', markers: MARKERS, speed: 1, idleTimeLimit: 2 };
+  if (linkT != null && linkT > 0) opts.startAt = linkT;
+  const player = BeeCastPlayer.create({ data: CAST_DATA }, $('player'), opts);
 
   $('copy-t').addEventListener('click', () => {
-    Promise.resolve(player ? player.getCurrentTime() : 0).then((now) => {
-      const t = Math.round(now * 10) / 10;
-      const base = location.href.split(/[?#]/)[0];
-      let url = base + '?t=' + t;
-      const note = $('note').value.trim();
-      if (note) url += '&note=' + encodeURIComponent(note);
-      try { history.replaceState(null, '', url); } catch (e) { /* some file:// contexts refuse; the copy below still works */ }
-      const done = () => {
-        $('copied').style.visibility = 'visible';
-        setTimeout(() => { $('copied').style.visibility = 'hidden'; }, 1200);
-      };
-      const fallback = () => {
-        const ta = document.createElement('textarea');
-        ta.value = url;
-        ta.style.position = 'fixed';
-        ta.style.opacity = '0';
-        document.body.appendChild(ta);
-        ta.select();
-        let ok = false;
-        try { ok = document.execCommand('copy'); } catch (e) {}
-        document.body.removeChild(ta);
-        if (ok) done(); else window.prompt('Copy this link:', url);
-      };
-      if (navigator.clipboard && navigator.clipboard.writeText) {
-        navigator.clipboard.writeText(url).then(done, fallback);
-      } else {
-        fallback();
-      }
-    });
+    const now = player.getCurrentTime();
+    const t = Math.round(now * 10) / 10;
+    const base = location.href.split(/[?#]/)[0];
+    let url = base + '?t=' + t;
+    const note = $('note').value.trim();
+    if (note) url += '&note=' + encodeURIComponent(note);
+    try { history.replaceState(null, '', url); } catch (e) { /* some file:// contexts refuse; the copy below still works */ }
+    const done = () => {
+      const el = $('copied');
+      el.hidden = false;
+      setTimeout(() => { el.hidden = true; }, 1200);
+    };
+    const fallback = () => {
+      const ta = document.createElement('textarea');
+      ta.value = url;
+      ta.style.position = 'fixed';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.select();
+      let ok = false;
+      try { ok = document.execCommand('copy'); } catch (e) {}
+      document.body.removeChild(ta);
+      if (ok) done(); else window.prompt('Copy this link:', url);
+    };
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(url).then(done, fallback);
+    } else {
+      fallback();
+    }
   });
 
   if (linkNote) {
@@ -178,8 +146,6 @@ const META = @@BEECAST_META_JSON@@;
     nb.hidden = false;
     $('note').value = linkNote; // pre-fill so re-sharing keeps the comment
   }
-
-  create(linkT, false);
 })();
 </script>
 </body>

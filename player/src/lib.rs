@@ -1,19 +1,22 @@
 //! The first-party beecast player as a crate: clean-room, dependency-free
 //! asciicast (v1/v2/v3) player and VT100/xterm-subset terminal emulator. Consumers inline
 //! the two constants whole — a `<script>` element and a `<style>` element — and get the
-//! full player: parsing, emulation, playback with idle compression, chapter markers,
-//! keyboard control, and live-follow `append` for recordings that are still growing.
+//! full player: parsing, emulation, headless controller, default controls, Web Component,
+//! chapter markers, keyboard control, and live-follow `append` for recordings that are
+//! still growing.
 //!
-//! The JS globals are `BeeCastVT` (the DOM-free core) and `BeeCastPlayer` (the public
-//! API); this crate is the component's canonical home.
+//! The JS globals are `BeeCastVT` (DOM-free core), `BeeCastController` (headless playback),
+//! and `BeeCastPlayer` (DOM factory + `<beecast-player>`); this crate is the component's
+//! canonical home.
 
-/// The player bundle: `vt.js` (asciicast parsing + the VT emulator + the pacing map, all
-/// DOM-free) then `player.js` (the renderer, playback clock, and controls). Inline it in
-/// one `<script>` element; it performs no network requests and loads no workers.
-pub const PLAYER_JS: &str = concat!(include_str!("vt.js"), "\n", include_str!("player.js"));
+/// The player bundle: `vt.js` (core) + `controller.js` (headless playback) + `player.js`
+/// (DOM view, Web Component, legacy factory). Inline it in one `<script>` element; it
+/// performs no network requests and loads no workers.
+pub const PLAYER_JS: &str =
+  concat!(include_str!("vt.js"), "\n", include_str!("controller.js"), "\n", include_str!("player.js"),);
 
-/// The player chrome and terminal palette. All colors are CSS variables, so the embedding
-/// page can theme them; nothing is fetched (no fonts, no images).
+/// The player chrome and terminal palette. Semantic `--beecast-*` tokens are the stable
+/// theming surface; `--sp-*` is the terminal palette. Nothing is fetched (no fonts, no images).
 pub const PLAYER_CSS: &str = include_str!("player.css");
 
 #[cfg(test)]
@@ -32,14 +35,44 @@ mod tests {
     assert!(!PLAYER_JS.to_lowercase().contains("worker"), "bundle must not load a worker sidecar");
     assert!(!PLAYER_CSS.contains("url("), "player CSS must not fetch fonts/images");
     assert!(PLAYER_JS.contains("BeeCastPlayer") && PLAYER_JS.contains("Clean-room implementation"));
+    assert!(PLAYER_JS.contains("BeeCastController"));
+    assert!(PLAYER_JS.contains("beecast-player"));
     for banned in ["asciinema-player", "AsciinemaPlayer", "@license", "Apache"] {
       assert!(!PLAYER_JS.contains(banned) && !PLAYER_CSS.contains(banned), "third-party marker '{banned}'");
     }
   }
 
-  /// Behavior tests for the DOM-free core (`BeeCastVT`), run under Node: parsing, the
-  /// emulator subset, live-follow appends, and the pacing map. Skips silently when `node`
-  /// is not installed — the structural assertions above still gate the bundle.
+  /// Phase 0: the public surface must not shrink without an intentional change.
+  #[test]
+  fn public_api_surface_is_documented() {
+    for key in [
+      "BeeCastVT",
+      "BeeCastController",
+      "BeeCastPlayer",
+      "parseCast",
+      "appendCast",
+      "buildPacing",
+      "extendPacing",
+      "mapTime",
+      "create",
+      "getState",
+      "subscribe",
+      "setSpeed",
+      "publicMethods",
+      "supportedCssVariables",
+      "nonPublicFields",
+    ] {
+      assert!(PLAYER_JS.contains(key), "public surface missing {key}");
+    }
+    for token in
+      ["--beecast-color-surface", "--beecast-color-accent", "--beecast-color-focus", "--beecast-font-terminal"]
+    {
+      assert!(PLAYER_CSS.contains(token), "theme token missing {token}");
+    }
+  }
+
+  /// Behavior tests for the DOM-free core and headless controller, run under Node.
+  /// Skips silently when `node` is not installed — the structural assertions above still gate the bundle.
   #[test]
   fn vt_core_node_selftest() {
     let dir = std::env::temp_dir().join(format!("beecast-vt-selftest-{}", std::process::id()));
@@ -50,46 +83,55 @@ mod tests {
 const assert = require('assert');
 require(process.argv[2]);
 const VT = globalThis.BeeCastVT;
+const C = globalThis.BeeCastController;
+const P = globalThis.BeeCastPlayer;
 
-// v3: intervals sum; term size from the header; resize + marker events survive; # comments skip.
+// ---- Phase 0: public keys --------------------------------------------------------------
+for (const k of ['parseCast','appendCast','buildPacing','extendPacing','mapTime','Term']) {
+  assert.strictEqual(typeof VT[k], 'function', 'BeeCastVT.' + k);
+}
+assert.strictEqual(typeof C.create, 'function');
+assert.strictEqual(typeof P.create, 'function');
+assert.ok(Array.isArray(P.publicMethods));
+for (const m of ['create','play','pause','toggle','seek','getCurrentTime','append','dispose']) {
+  assert.ok(P.publicMethods.includes(m), 'publicMethods missing ' + m);
+}
+assert.ok(P.nonPublicFields.includes('playing'));
+assert.ok(P.nonPublicFields.includes('pacedPos'));
+assert.ok(P.supportedCssVariables.includes('--beecast-color-accent'));
+
+// ---- VT core (existing coverage) -------------------------------------------------------
 let c = VT.parseCast('{"version":3,"term":{"cols":10,"rows":3}}\n# note\n[0.5,"o","hi"]\n[0.5,"m","chapter"]\n[1.0,"r","20x5"]\n');
 assert.strictEqual(c.cols, 10); assert.strictEqual(c.rows, 3);
 assert.strictEqual(c.events.length, 3);
 assert.strictEqual(c.duration, 2);
 
-// v2: absolute times.
 c = VT.parseCast('{"version":2,"width":80,"height":24}\n[0.5,"o","a"]\n[2.0,"o","b"]\n');
 assert.strictEqual(c.duration, 2); assert.strictEqual(c.events[1].t, 2);
 
-// v1: one JSON doc, stdout deltas.
 c = VT.parseCast('{"version":1,"width":5,"height":2,"stdout":[[0.1,"x"],[0.2,"y"]]}');
 assert.strictEqual(c.cols, 5); assert.strictEqual(c.events.length, 2);
 
-// Live-follow: appendCast grows a v3 cast across arbitrary chunk boundaries.
 c = VT.parseCast('{"version":3,"term":{"cols":10,"rows":3}}\n[1.0,"o","a"]\n');
-assert.strictEqual(VT.appendCast(c, '[0.5,"o",'), 0);            // partial line buffers
+assert.strictEqual(VT.appendCast(c, '[0.5,"o",'), 0);
 assert.strictEqual(c.duration, 1);
-assert.strictEqual(VT.appendCast(c, '"b"]\n[0.5,"m","x"]\n'), 2); // completed + one more
+assert.strictEqual(VT.appendCast(c, '"b"]\n[0.5,"m","x"]\n'), 2);
 assert.strictEqual(c.duration, 2);
 assert.strictEqual(c.events.length, 3);
 assert.strictEqual(c.events[1].t, 1.5);
 
-// v2 appends carry absolute times; stray comment and header lines are skipped.
 c = VT.parseCast('{"version":2,"width":80,"height":24}\n[1.0,"o","a"]\n');
 VT.appendCast(c, '# noise\n{"version":2}\n[3.0,"o","b"]\n');
 assert.strictEqual(c.duration, 3); assert.strictEqual(c.events[1].t, 3);
 
-// A load-time partial trailing line is held back and completed by the first append.
 c = VT.parseCast('{"version":3,"term":{"cols":4,"rows":1}}\n[1.0,"o","hi"]\n[2.0,"o');
 assert.strictEqual(c.events.length, 1);
 VT.appendCast(c, '","yo"]\n');
 assert.strictEqual(c.events.length, 2); assert.strictEqual(c.duration, 3);
 
-// v1 casts never grow.
 c = VT.parseCast('{"version":1,"width":5,"height":2,"stdout":[[0.1,"x"]]}');
 assert.strictEqual(VT.appendCast(c, '[1.0,"o","y"]\n'), 0);
 
-// The pacing map extends in place and keeps both directions consistent.
 const ev = [{t:1},{t:2}];
 const pacing = VT.buildPacing(ev, 2, null);
 ev.push({t:10});
@@ -97,11 +139,10 @@ VT.extendPacing(pacing, ev, 2, 10);
 assert.strictEqual(pacing.pacedDuration, 10);
 assert.strictEqual(VT.mapTime(pacing.rec, pacing.paced, 10), 10);
 const limited = VT.buildPacing([{t:1}], 1, 2);
-VT.extendPacing(limited, [{t:1},{t:9}], 1, 9);                    // an 8s silence plays as 2s
+VT.extendPacing(limited, [{t:1},{t:9}], 1, 9);
 assert.strictEqual(limited.pacedDuration, 3);
 assert.strictEqual(VT.mapTime(limited.paced, limited.rec, 3), 9);
 
-// Plain text, CR/LF, cursor addressing, erase.
 let t = new VT.Term(10, 3);
 t.write('hello\r\nworld');
 assert.deepStrictEqual(t.textLines(), ['hello', 'world', '']);
@@ -110,7 +151,6 @@ assert.strictEqual(t.textLines()[0], 'hegao');
 t.write('\x1b[2J');
 assert.deepStrictEqual(t.textLines(), ['', '', '']);
 
-// SGR runs merge; 16/256/true color.
 t = new VT.Term(10, 1);
 t.write('\x1b[31mred\x1b[0m ok');
 const runs = t.snapshot().rows[0];
@@ -120,14 +160,12 @@ t.write('\x1b[38;5;196mX\x1b[38;2;1;2;3mY');
 assert.strictEqual(t.snapshot().rows[0][0].fg, 196);
 assert.strictEqual(t.snapshot().rows[0][1].fg, '#010203');
 
-// Deferred wrap.
 t = new VT.Term(3, 2);
 t.write('abc');
 assert.strictEqual(t.snapshot().cursor.y, 0);
 t.write('d');
 assert.deepStrictEqual(t.textLines(), ['abc', 'd']);
 
-// Scroll region.
 t = new VT.Term(5, 4);
 t.write('aa\r\nbb\r\ncc\r\ndd');
 t.write('\x1b[2;3r\x1b[3;1H\n');
@@ -135,7 +173,6 @@ assert.strictEqual(t.textLines()[0], 'aa');
 assert.strictEqual(t.textLines()[1], 'cc');
 assert.strictEqual(t.textLines()[3], 'dd');
 
-// Alternate screen restores the primary.
 t = new VT.Term(5, 2);
 t.write('main');
 t.write('\x1b[?1049h\x1b[Halt');
@@ -143,7 +180,6 @@ assert.strictEqual(t.textLines()[0], 'alt');
 t.write('\x1b[?1049l');
 assert.strictEqual(t.textLines()[0], 'main');
 
-// DEC special graphics (tmux borders); OSC consumed; cursor visibility.
 t = new VT.Term(4, 1);
 t.write('\x1b(0qqx\x1b(B');
 assert.strictEqual(t.textLines()[0], '──│');
@@ -152,6 +188,148 @@ t.write('\x1b]0;title\x07ok');
 assert.strictEqual(t.textLines()[0], 'ok');
 t.write('\x1b[?25l');
 assert.strictEqual(t.snapshot().cursor.visible, false);
+
+// ---- Phase 1: headless controller (no DOM) ---------------------------------------------
+function fakeClock() {
+  let now = 0;
+  const q = [];
+  return {
+    now: () => now,
+    requestAnimationFrame: (cb) => { q.push(cb); return q.length; },
+    cancelAnimationFrame: () => { q.length = 0; },
+    flush: (ms) => {
+      now += ms;
+      const batch = q.splice(0, q.length);
+      for (const cb of batch) cb(now);
+    },
+  };
+}
+
+const castText = '{"version":3,"term":{"cols":8,"rows":2}}\n[0,"o","hi"]\n[1.0,"o","!"]\n[1.0,"m","mid"]\n';
+const clock = fakeClock();
+const ctrl = C.create({
+  data: castText,
+  idleTimeLimit: 2,
+  speed: 1,
+  markers: [[0, 'start']],
+  clock: clock,
+});
+
+// Initial state
+let state = ctrl.getState();
+assert.strictEqual(state.status, 'idle');
+assert.strictEqual(state.currentTime, 0);
+assert.strictEqual(state.duration, 2);
+assert.strictEqual(state.speed, 1);
+assert.strictEqual(state.canAppend, true);
+assert.ok(state.markers.length >= 2); // sidecar + in-band
+assert.ok(state.markers.every(m => m.id && typeof m.time === 'number' && m.label != null));
+assert.ok(state.terminal.rows.length === 2);
+assert.strictEqual(state.dimensions.columns, 8);
+
+// subscribe delivers immediately and is removable
+const seen = [];
+const unsub = ctrl.subscribe((s, meta) => { seen.push(meta.type); });
+assert.ok(seen.includes('ready'));
+unsub();
+unsub(); // idempotent
+const n = seen.length;
+ctrl.setSpeed(2);
+// no more callbacks after unsubscribe
+assert.strictEqual(seen.length, n);
+
+// setSpeed does not rebuild terminal / changes state
+ctrl.setSpeed(1.5);
+assert.strictEqual(ctrl.getState().speed, 1.5);
+
+// play / pause / seek / getCurrentTime
+// First animation frame establishes lastTick (dt=0); the second advances the clock.
+ctrl.play();
+assert.strictEqual(ctrl.getState().status, 'playing');
+clock.flush(0);
+clock.flush(500); // 0.5s wall * 1.5 speed ≈ 0.75s paced
+assert.ok(ctrl.getCurrentTime() > 0);
+ctrl.pause();
+assert.strictEqual(ctrl.getState().status, 'paused');
+
+ctrl.seek(1.5);
+assert.ok(Math.abs(ctrl.getCurrentTime() - 1.5) < 1e-9);
+ctrl.seek(0);
+assert.ok(ctrl.getCurrentTime() < 1e-9);
+
+// toggle
+ctrl.toggle();
+assert.strictEqual(ctrl.getState().status, 'playing');
+ctrl.toggle();
+assert.strictEqual(ctrl.getState().status, 'paused');
+
+// replay after end
+ctrl.seek(2);
+ctrl.play();
+// playing from end rewinds
+assert.strictEqual(ctrl.getState().status, 'playing');
+assert.ok(ctrl.getCurrentTime() < 1e-6);
+
+// append live-follow at edge
+ctrl.pause();
+ctrl.seek(2);
+assert.ok(ctrl.getState().atLiveEdge);
+ctrl.append('[0.5,"o","more"]\n');
+assert.strictEqual(ctrl.getState().duration, 2.5);
+
+// getState is a snapshot (mutating returned markers does not corrupt internal list)
+const s1 = ctrl.getState();
+s1.markers.push({ id: 'x', time: 99, type: 'chapter', label: 'x' });
+assert.ok(ctrl.getState().markers.every(m => m.id !== 'x'));
+
+// dispose makes commands no-ops
+ctrl.dispose();
+ctrl.play();
+ctrl.seek(1);
+ctrl.append('[1,"o","z"]\n');
+assert.strictEqual(ctrl.getState().status, 'idle');
+
+// Marker object form + tuple compatibility
+const c2 = C.create({
+  data: '{"version":3,"term":{"cols":4,"rows":1}}\n[0,"o","a"]\n',
+  markers: [{ time: 0, label: 'A', type: 'chapter' }, [1, 'B']],
+  clock: fakeClock(),
+});
+const marks = c2.getState().markers;
+assert.strictEqual(marks[0].label, 'A');
+assert.strictEqual(marks[1].label, 'B');
+c2.dispose();
+
+// Source type text
+const c3 = C.create({
+  source: { type: 'text', data: '{"version":3,"term":{"cols":4,"rows":1}}\n[0,"o","z"]\n' },
+  clock: fakeClock(),
+});
+assert.strictEqual(c3.getState().duration, 0);
+c3.dispose();
+
+// Discrete events survive playback: seek/speedchange/durationchange/markerchange emitted
+// WHILE PLAYING must each reach subscribers with their own meta type — timeupdate
+// coalescing must never swallow them.
+const clock4 = fakeClock();
+const c4 = C.create({ data: castText, idleTimeLimit: 2, clock: clock4 });
+const types = [];
+c4.subscribe(function (s, meta) { types.push(meta.type); });
+c4.play();
+clock4.flush(0);
+clock4.flush(200);
+assert.ok(types.includes('timeupdate'), 'timeupdate flows while playing');
+assert.strictEqual(c4.getState().status, 'playing');
+c4.seek(1.5, { origin: 'api' });
+assert.ok(types.includes('seek'), 'seek delivered while playing, saw: ' + types.join(','));
+c4.append('[5,"o","tail"]\n');
+assert.ok(types.includes('durationchange'), 'durationchange delivered while playing');
+c4.setSpeed(2);
+assert.ok(types.includes('speedchange'), 'speedchange delivered while playing');
+c4.setMarkers([[0.5, 'half']]);
+assert.ok(types.includes('markerchange'), 'markerchange delivered');
+assert.strictEqual(c4.getState().markers.filter(m => m.source === 'integration').length, 1);
+c4.dispose();
 
 console.log('vt selftest OK');
 "#;
