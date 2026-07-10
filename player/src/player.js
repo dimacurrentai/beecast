@@ -1,26 +1,30 @@
-// beecast-player: the DOM half (see the crate README). Renders BeeCastVT snapshots,
-// drives the playback clock, and exposes the public BeeCastPlayer API.
+// beecast-player: the DOM half (see the crate README). Renders controller state,
+// builds the default controls, registers <beecast-player>, and keeps BeeCastPlayer.create
+// as a compatibility adapter over the same surface.
 //
 // Clean-room implementation, MIT like the rest of beecast. The time axis is ALWAYS
-// recording time: idle compression (idleTimeLimit) only changes pacing, never the clock
-// the API speaks. The pacing map itself lives in the DOM-free core (vt.js).
+// recording time: idle compression only changes pacing, never the clock the API speaks.
 'use strict';
 (function (root) {
 
 const VT = root.BeeCastVT;
+const Controller = root.BeeCastController;
 const SEEK_STEP_SECS = 5;
-const SPEEDS = [0.5, 1, 1.5, 2, 3, 5];
+const SPEEDS = Controller.SPEEDS;
 
-// The big center play glyph: block characters, because this is a terminal player. Widths
-// double the row steps so the triangle reads as wide as it is tall in a monospace cell.
+// The big center play glyph: a solid right-pointing triangle in block characters.
+// Half-block edges soften the silhouette so it reads as a play icon, not a staircase.
 const BIG_PLAY =
-  '██\n' +
+  '  ▄█\n' +
+  ' ████\n' +
   '██████\n' +
-  '██████████\n' +
-  '██████████████\n' +
-  '██████████\n' +
+  '████████\n' +
   '██████\n' +
-  '██';
+  ' ████\n' +
+  '  ▀█';
+
+const ICON_PLAY = '▶';
+const ICON_PAUSE = '⏸';
 
 // ---- rendering -------------------------------------------------------------------------
 const ATTR_CLASSES = [
@@ -30,8 +34,7 @@ const ATTR_CLASSES = [
 
 function colorCss(c, bold) {
   if (c == null) return null;
-  if (typeof c === 'string') return c; // '#rrggbb'
-  // Bold brightens the 8 base colors — the classic terminal behavior TUIs count on.
+  if (typeof c === 'string') return c;
   const idx = bold && c < 8 ? c + 8 : c;
   return idx < 16 ? 'var(--sp-c' + idx + ')' : VT.color256(idx);
 }
@@ -41,7 +44,6 @@ function esc(s) {
 }
 
 function runHtml(run, hasCursor, cursorCol) {
-  // The cursor splits its run into up-to-three spans so only one cell inverts.
   if (hasCursor && run.text.length > 1) {
     const before = { text: run.text.slice(0, cursorCol), fg: run.fg, bg: run.bg, attrs: run.attrs };
     const at = { text: run.text[cursorCol] || ' ', fg: run.fg, bg: run.bg, attrs: run.attrs };
@@ -86,188 +88,430 @@ function fmtClock(secs) {
   return m + ':' + String(s).padStart(2, '0');
 }
 
-function parseTime(v) {
-  if (typeof v === 'number' && isFinite(v)) return v;
-  const m = /^(\d+):(\d{1,2})$/.exec(String(v || '').trim());
-  if (m) return Number(m[1]) * 60 + Number(m[2]);
-  const n = parseFloat(v);
-  return isFinite(n) ? n : 0;
+function parseControls(controls) {
+  if (controls === false) {
+    return { play: false, seek: false, time: false, speed: false, chapters: false, fullscreen: false };
+  }
+  const d = { play: true, seek: true, time: true, speed: true, chapters: true, fullscreen: true };
+  if (controls && typeof controls === 'object') {
+    for (const k of Object.keys(d)) {
+      if (controls[k] != null) d[k] = !!controls[k];
+    }
+  }
+  return d;
 }
 
-// ---- player ----------------------------------------------------------------------------
+function dispatchBee(el, name, detail) {
+  if (!el || typeof CustomEvent === 'undefined') return;
+  try {
+    el.dispatchEvent(new CustomEvent(name, {
+      detail: detail || {},
+      bubbles: true,
+      composed: true,
+    }));
+  } catch (_) {}
+}
+
+// ---- player view -----------------------------------------------------------------------
 function Player(src, mount, opts) {
   opts = opts || {};
-  const cast = VT.parseCast(src && src.data);
-  this.cast = cast;
-  this.term = new VT.Term(cast.cols, cast.rows);
-  this.pacing = VT.buildPacing(cast.events, cast.duration, opts.idleTimeLimit);
-  // Chapter ticks come from BOTH the embedder (opts.markers) and the recording's own
-  // in-band "m" events — including ones that arrive later through append(), so the seek
-  // bar shows the same chapters live as it would after a reload.
-  this.markers = (opts.markers || []).map(function (m) { return { t: Number(m[0]) || 0, label: String(m[1] || '') }; });
-  this.absorbMarkers(0);
-  this.speed = SPEEDS.indexOf(Number(opts.speed)) >= 0 ? Number(opts.speed) : 1;
-  this.playing = false;
-  this.pacedPos = 0;   // the playback clock, in paced seconds
-  this.eventIdx = 0;   // events [0, eventIdx) are applied to the term
-  this.raf = null;
-  this.lastTick = null;
-  this.disposed = false;
-  // The fullscreen target: the embedding page may pass a wrapper (its own chrome — a
-  // chapters sidebar, a toolbar — rides along into fullscreen); default is the player.
-  this.fsEl = opts.fullscreenEl || null;
-  this.buildDom(mount, opts.controls !== false);
-  if (this.speedBtn) this.speedBtn.textContent = String(this.speed).replace(/\.0$/, '') + '\u00d7';
+  this.opts = opts;
+  this.controlsCfg = parseControls(opts.controls);
   this.fit = opts.fit || null;
-  this.applyEventsUpTo(0);
-  if (opts.startAt != null) this.seek(parseTime(opts.startAt));
-  this.render();
+  this.fsEl = opts.fullscreenEl || null;
+  this.accessibility = opts.accessibility || 'snapshot';
+  this.disposed = false;
+  this._lastAtEdge = null;
+
+  const data = src && (src.data != null ? src.data : src.cast);
+  this.controller = Controller.create({
+    data: data,
+    source: src && src.source,
+    idleTimeLimit: opts.idleTimeLimit,
+    markers: opts.markers,
+    speed: opts.speed,
+    startAt: opts.startAt,
+    clock: opts.clock,
+  });
+
+  this.buildDom(mount, this.controlsCfg);
+  this.bindController();
   this.layout();
-  this.syncOverlay();
-  this.syncChaptersUi();
+  // Compatibility surface: read-only playing getter over controller state.
+  Object.defineProperty(this, 'playing', {
+    configurable: true,
+    enumerable: true,
+    get: function () { return this.controller.isPlaying(); },
+  });
+  // Non-public fields kept readable during the migration window only.
+  Object.defineProperty(this, 'pacedPos', {
+    configurable: true,
+    get: function () { return this.controller.pacedPos; },
+  });
+  Object.defineProperty(this, 'eventIdx', {
+    configurable: true,
+    get: function () { return this.controller.eventIdx; },
+  });
+  Object.defineProperty(this, 'cast', {
+    configurable: true,
+    get: function () { return this.controller.cast; },
+  });
+  Object.defineProperty(this, 'speed', {
+    configurable: true,
+    get: function () { return this.controller.speed; },
+    set: function (v) { this.controller.setSpeed(v); },
+  });
+
   if (opts.autoPlay) this.play();
   const self = this;
   if (typeof ResizeObserver !== 'undefined') {
     this.resizeObs = new ResizeObserver(function () { self.layout(); });
     this.resizeObs.observe(this.root.parentNode || this.root);
   }
-  // Entering/leaving fullscreen resizes the root itself, which the parent-watching
-  // ResizeObserver may not notice — refit explicitly.
   this.fsHandler = function () { self.layout(); };
-  document.addEventListener('fullscreenchange', this.fsHandler);
+  if (typeof document !== 'undefined') {
+    document.addEventListener('fullscreenchange', this.fsHandler);
+  }
 }
 
-Player.prototype.buildDom = function (mount, controls) {
+Player.prototype.bindController = function () {
+  const self = this;
+  this.unsubscribe = this.controller.subscribe(function (state, meta) {
+    self.onState(state, meta || {});
+  });
+};
+
+Player.prototype.onState = function (state, meta) {
+  if (this.disposed) return;
+  const type = meta.type || 'change';
+
+  if (this.screenEl) {
+    if (type === 'ready' || type === 'seek' || type === 'play' || type === 'pause' ||
+        type === 'ended' || type === 'timeupdate' || type === 'durationchange' ||
+        type === 'change' || meta.terminalChanged || meta.resized) {
+      // High-frequency path: still render terminal when it may have changed.
+      if (type !== 'timeupdate' || meta.terminalChanged || meta.resized || !this._paintedOnce) {
+        this.screenEl.innerHTML = screenHtml(state.terminal);
+        this._paintedOnce = true;
+        if (this.accessibility === 'snapshot' && this.a11yEl) {
+          this.a11yEl.textContent = terminalPlain(state.terminal);
+        }
+      }
+    }
+  }
+
+  this.renderBar(state);
+  this.syncOverlay(state);
+  this.syncChaptersUi(state);
+  if (meta.resized) this.layout();
+  if (type === 'ready' || type === 'durationchange' || type === 'markerchange') {
+    this.layoutMarkers(state);
+  }
+
+  // Integration events on the root element (Phase 2).
+  const el = this.eventTarget || this.root;
+  if (type === 'ready') dispatchBee(el, 'beecast-ready', { state: publicState(state) });
+  if (type === 'play') dispatchBee(el, 'beecast-play', { origin: meta.origin, currentTime: state.currentTime });
+  if (type === 'pause') dispatchBee(el, 'beecast-pause', { origin: meta.origin, currentTime: state.currentTime });
+  if (type === 'ended') dispatchBee(el, 'beecast-ended', { currentTime: state.currentTime, duration: state.duration });
+  if (type === 'seek') {
+    dispatchBee(el, 'beecast-seek', {
+      origin: meta.origin,
+      currentTime: state.currentTime,
+      duration: state.duration,
+    });
+  }
+  if (type === 'timeupdate') {
+    dispatchBee(el, 'beecast-timeupdate', {
+      currentTime: state.currentTime,
+      duration: state.duration,
+      atLiveEdge: state.atLiveEdge,
+    });
+  }
+  if (type === 'speedchange') {
+    dispatchBee(el, 'beecast-speedchange', { speed: state.speed, origin: meta.origin });
+  }
+  if (type === 'durationchange') {
+    dispatchBee(el, 'beecast-durationchange', { duration: state.duration });
+  }
+  if (this._lastAtEdge != null && this._lastAtEdge !== state.atLiveEdge) {
+    dispatchBee(el, 'beecast-liveedgechange', { atLiveEdge: state.atLiveEdge });
+  }
+  if (type === 'durationchange' || type === 'ready' || type === 'markerchange') {
+    dispatchBee(el, 'beecast-markerchange', { markers: state.markers });
+  }
+  this._lastAtEdge = state.atLiveEdge;
+};
+
+function publicState(state) {
+  return {
+    status: state.status,
+    currentTime: state.currentTime,
+    duration: state.duration,
+    speed: state.speed,
+    atLiveEdge: state.atLiveEdge,
+    canAppend: state.canAppend,
+    markers: state.markers,
+    dimensions: state.dimensions,
+  };
+}
+
+function terminalPlain(snap) {
+  const lines = [];
+  for (let y = 0; y < snap.rows.length; y++) {
+    let s = '';
+    for (const run of snap.rows[y]) s += run.text;
+    lines.push(s.replace(/\s+$/, ''));
+  }
+  return lines.join('\n');
+}
+
+Player.prototype.buildDom = function (mount, cfg) {
   const self = this;
   const root = document.createElement('div');
   root.className = 'beecast-player';
+  root.setAttribute('part', 'root');
   root.tabIndex = 0;
+  root.setAttribute('role', 'application');
+  root.setAttribute('aria-label', 'Terminal recording player');
+
+  let bar = '';
+  if (cfg.play || cfg.seek || cfg.time || cfg.speed || cfg.chapters || cfg.fullscreen) {
+    bar = '<div class="sp-bar" part="toolbar">';
+    if (cfg.play) {
+      bar += '<button class="sp-play" type="button" part="play-button" ' +
+        'aria-label="Play" title="play/pause (space)">' + ICON_PLAY + '</button>';
+    }
+    if (cfg.time) bar += '<span class="sp-time" part="current-time" aria-hidden="true">0:00</span>';
+    if (cfg.seek) {
+      bar += '<div class="sp-seek" part="seek" role="slider" tabindex="0" ' +
+        'aria-label="Seek" aria-valuemin="0" aria-valuemax="0" aria-valuenow="0">' +
+        '<div class="sp-fill"></div><div class="sp-markers"></div></div>';
+    }
+    if (cfg.time) bar += '<span class="sp-dur" part="duration" aria-hidden="true">0:00</span>';
+    if (cfg.chapters) {
+      bar += '<button class="sp-chapbtn" type="button" part="chapter-button" ' +
+        'aria-label="Chapters" aria-expanded="false" title="chapters (c)" hidden>☰</button>';
+    }
+    if (cfg.speed) {
+      bar += '<span class="sp-speedwrap">' +
+        '<button class="sp-speed" type="button" part="speed-button" ' +
+        'aria-label="Playback speed" aria-haspopup="menu" aria-expanded="false" ' +
+        'title="speed (&lt; / &gt;)">1×</button>' +
+        '<div class="sp-speedmenu" part="speed-menu" role="menu" hidden></div></span>';
+    }
+    if (cfg.fullscreen) {
+      bar += '<button class="sp-fs" type="button" part="fullscreen-button" ' +
+        'aria-label="Fullscreen" title="fullscreen (f)">⛶</button>';
+    }
+    bar += '</div>';
+  }
+
   root.innerHTML =
-    '<div class="sp-screen-box"><pre class="sp-screen"></pre>' +
-    '<div class="sp-overlay" hidden><pre class="sp-bigplay">' + BIG_PLAY + '</pre></div>' +
-    '<div class="sp-chapters" hidden></div>' +
-    '</div>' +
-    (controls
-      ? '<div class="sp-bar">' +
-        '<button class="sp-play" type="button" title="play/pause (space)">▶</button>' +
-        '<span class="sp-time">0:00</span>' +
-        '<div class="sp-seek"><div class="sp-fill"></div><div class="sp-markers"></div></div>' +
-        '<span class="sp-dur">0:00</span>' +
-        '<button class="sp-chapbtn" type="button" title="chapters (c)" hidden>☰</button>' +
-        '<span class="sp-speedwrap">' +
-        '<button class="sp-speed" type="button" title="speed (&lt; / &gt;)">1×</button>' +
-        '<div class="sp-speedmenu" hidden></div>' +
-        '</span>' +
-        '<button class="sp-fs" type="button" title="fullscreen (f)">⛶</button>' +
-        '</div>'
-      : '');
+    '<div class="sp-screen-box" part="screen-box">' +
+    '<pre class="sp-screen" part="screen" aria-hidden="true"></pre>' +
+    (this.accessibility === 'snapshot'
+      ? '<pre class="sp-a11y" part="terminal-text"></pre>'
+      : '') +
+    '<div class="sp-overlay" part="overlay" hidden role="button" tabindex="0" ' +
+    'aria-label="Play recording"><pre class="sp-bigplay" aria-hidden="true">' + BIG_PLAY + '</pre></div>' +
+    '<div class="sp-chapters" part="chapter-panel" role="menu" hidden></div>' +
+    '</div>' + bar;
+
   mount.appendChild(root);
   this.root = root;
   this.screenEl = root.querySelector('.sp-screen');
+  this.a11yEl = root.querySelector('.sp-a11y');
   this.playBtn = root.querySelector('.sp-play');
   this.timeEl = root.querySelector('.sp-time');
   this.durEl = root.querySelector('.sp-dur');
   this.seekEl = root.querySelector('.sp-seek');
   this.fillEl = root.querySelector('.sp-fill');
   this.speedBtn = root.querySelector('.sp-speed');
-  if (this.durEl) this.durEl.textContent = fmtClock(this.cast.duration);
-  if (this.playBtn) this.playBtn.addEventListener('click', function () { self.toggle(); });
-  // A big center play button while the recording sits at its very start: click plays.
-  // The click must not bubble to the root's focus handler AND the pane's own listeners.
-  this.overlayEl = root.querySelector('.sp-overlay');
-  this.overlayEl.addEventListener('click', function (ev) {
-    ev.stopPropagation();
-    self.play();
-    try { root.focus({ preventScroll: true }); } catch (_) { root.focus(); }
-  });
-  // The speed button opens a menu of the fixed speeds, growing UP from the bar.
   this.speedMenuEl = root.querySelector('.sp-speedmenu');
+  this.chapBtn = root.querySelector('.sp-chapbtn');
+  this.chaptersEl = root.querySelector('.sp-chapters');
+  this.fsBtn = root.querySelector('.sp-fs');
+  this.overlayEl = root.querySelector('.sp-overlay');
+  this.marksEl = root.querySelector('.sp-markers');
+
+  if (this.playBtn) {
+    this.playBtn.addEventListener('click', function () { self.toggle('pointer'); });
+  }
+  if (this.overlayEl) {
+    const playFromOverlay = function (ev) {
+      ev.stopPropagation();
+      self.play('pointer');
+      try { root.focus({ preventScroll: true }); } catch (_) { root.focus(); }
+    };
+    this.overlayEl.addEventListener('click', playFromOverlay);
+    this.overlayEl.addEventListener('keydown', function (ev) {
+      if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); playFromOverlay(ev); }
+    });
+  }
   if (this.speedBtn) {
     this.speedBtn.addEventListener('click', function (ev) {
       ev.stopPropagation();
       self.toggleSpeedMenu();
     });
   }
-  this.chapBtn = root.querySelector('.sp-chapbtn');
-  this.chaptersEl = root.querySelector('.sp-chapters');
-  if (this.chapBtn) this.chapBtn.addEventListener('click', function () { self.toggleChapters(); });
-  this.fsBtn = root.querySelector('.sp-fs');
-  if (this.fsBtn) this.fsBtn.addEventListener('click', function () { self.toggleFullscreen(); });
+  if (this.chapBtn) {
+    this.chapBtn.addEventListener('click', function () { self.toggleChapters(); });
+  }
+  if (this.fsBtn) {
+    this.fsBtn.addEventListener('click', function () { self.toggleFullscreen(); });
+  }
   if (this.seekEl) {
-    const seekTo = function (ev) {
+    const seekTo = function (ev, origin) {
       const r = self.seekEl.getBoundingClientRect();
       const frac = Math.min(1, Math.max(0, (ev.clientX - r.left) / (r.width || 1)));
-      self.seek(frac * self.cast.duration);
+      const dur = self.controller.cast.duration;
+      self.seek(frac * dur, origin || 'pointer');
     };
     this.seekEl.addEventListener('mousedown', function (ev) {
-      seekTo(ev);
-      const move = function (e) { seekTo(e); };
-      const up = function () { document.removeEventListener('mousemove', move); document.removeEventListener('mouseup', up); };
+      seekTo(ev, 'pointer');
+      const move = function (e) { seekTo(e, 'pointer'); };
+      const up = function () {
+        document.removeEventListener('mousemove', move);
+        document.removeEventListener('mouseup', up);
+      };
       document.addEventListener('mousemove', move);
       document.addEventListener('mouseup', up);
     });
-    this.marksEl = root.querySelector('.sp-markers');
-    this.layoutMarkers();
+    this.seekEl.addEventListener('keydown', function (ev) {
+      const dur = self.controller.cast.duration;
+      const now = self.getCurrentTime();
+      let t = null;
+      if (ev.key === 'ArrowLeft') t = now - SEEK_STEP_SECS;
+      else if (ev.key === 'ArrowRight') t = now + SEEK_STEP_SECS;
+      else if (ev.key === 'PageDown') t = now - 30;
+      else if (ev.key === 'PageUp') t = now + 30;
+      else if (ev.key === 'Home') t = 0;
+      else if (ev.key === 'End') t = dur;
+      else return;
+      ev.preventDefault();
+      self.seek(t, 'keyboard');
+    });
   }
   this.keyHandler = function (ev) { self.onKey(ev); };
   root.addEventListener('keydown', this.keyHandler);
-  root.addEventListener('click', function () { try { root.focus({ preventScroll: true }); } catch (_) { root.focus(); } });
+  root.addEventListener('click', function () {
+    try { root.focus({ preventScroll: true }); } catch (_) { root.focus(); }
+  });
 };
 
-// Fold the recording's in-band "m" (marker) events from cast.events[fromIdx..] into
-// this.markers, kept sorted (jumpMarker walks them in time order; opts.markers may sit
-// anywhere relative to in-band ones).
-Player.prototype.absorbMarkers = function (fromIdx) {
-  let grew = false;
-  for (let i = fromIdx; i < this.cast.events.length; i++) {
-    const ev = this.cast.events[i];
-    if (ev.type === 'm') { this.markers.push({ t: ev.t, label: ev.data }); grew = true; }
-  }
-  if (grew) this.markers.sort(function (a, b) { return a.t - b.t; });
-};
-
-// The big center play button shows only while the recording sits at its very start —
-// paused mid-way (including a live player parked at the growing edge) stays undimmed.
-Player.prototype.syncOverlay = function () {
+Player.prototype.syncOverlay = function (state) {
   if (!this.overlayEl) return;
-  this.overlayEl.hidden = !(!this.playing && this.pacedPos <= 1e-9 && this.cast.duration > 0);
+  const show = state.status !== 'playing' && state.currentTime <= 1e-9 && state.duration > 0;
+  this.overlayEl.hidden = !show;
 };
 
-// ---- chapters panel (a scrollable list over the screen's right edge) --------------------
-Player.prototype.toggleChapters = function () {
+Player.prototype.renderBar = function (state) {
+  if (this.timeEl) this.timeEl.textContent = fmtClock(state.currentTime);
+  if (this.durEl) this.durEl.textContent = fmtClock(state.duration);
+  if (this.fillEl) {
+    this.fillEl.style.width = (state.duration > 0
+      ? Math.min(100, (state.currentTime / state.duration) * 100)
+      : 0) + '%';
+  }
+  if (this.seekEl) {
+    this.seekEl.setAttribute('aria-valuemin', '0');
+    this.seekEl.setAttribute('aria-valuemax', String(Math.floor(state.duration)));
+    this.seekEl.setAttribute('aria-valuenow', String(Math.floor(state.currentTime)));
+    this.seekEl.setAttribute('aria-valuetext', fmtClock(state.currentTime) + ' of ' + fmtClock(state.duration));
+  }
+  if (this.playBtn) {
+    const playing = state.status === 'playing';
+    this.playBtn.textContent = playing ? ICON_PAUSE : ICON_PLAY;
+    this.playBtn.setAttribute('aria-label', playing ? 'Pause' : 'Play');
+    this.playBtn.setAttribute('aria-pressed', playing ? 'true' : 'false');
+  }
+  if (this.speedBtn) {
+    this.speedBtn.textContent = String(state.speed).replace(/\.0$/, '') + '\u00d7';
+  }
+};
+
+Player.prototype.layoutMarkers = function (state) {
+  if (!this.marksEl) return;
+  this.marksEl.innerHTML = '';
+  if (!(state.duration > 0)) return;
+  for (const m of state.markers) {
+    const tick = document.createElement('div');
+    tick.className = 'sp-marker' + (m.type === 'annotation' ? ' sp-marker-ann' : '');
+    tick.style.left = Math.min(100, (m.time / state.duration) * 100) + '%';
+    if (m.color) tick.style.background = m.color;
+    tick.title = fmtClock(m.time) + (m.label ? ' ' + m.label : '');
+    this.marksEl.appendChild(tick);
+  }
+};
+
+Player.prototype.toggleChapters = function (force) {
   if (!this.chaptersEl) return;
-  this.chaptersEl.hidden = !this.chaptersEl.hidden;
-  if (!this.chaptersEl.hidden) this.renderChapters();
+  const show = force != null ? force : this.chaptersEl.hidden;
+  // Focus must be checked BEFORE hiding: hiding the focused row silently moves
+  // focus to <body>, and the ☰ button would never get it back.
+  const hadFocus = !show && typeof document !== 'undefined' &&
+    this.chaptersEl.contains(document.activeElement);
+  this.chaptersEl.hidden = !show;
+  if (this.chapBtn) this.chapBtn.setAttribute('aria-expanded', show ? 'true' : 'false');
+  if (show) this.renderChapters(this.controller.getState());
+  else if (hadFocus && this.chapBtn) {
+    try { this.chapBtn.focus({ preventScroll: true }); } catch (_) {}
+  }
 };
 
-Player.prototype.renderChapters = function () {
+Player.prototype.renderChapters = function (state) {
   if (!this.chaptersEl) return;
   const self = this;
   this.chaptersEl.innerHTML = '';
-  for (const m of this.markers) {
+  const now = state.currentTime;
+  let currentId = null;
+  for (let i = 0; i < state.markers.length; i++) {
+    if (state.markers[i].time <= now + 1e-9) currentId = state.markers[i].id;
+  }
+  for (const m of state.markers) {
     const row = document.createElement('button');
     row.type = 'button';
-    row.className = 'sp-chap';
+    row.className = 'sp-chap' + (m.id === currentId ? ' sp-chap-on' : '') +
+      (m.type === 'annotation' ? ' sp-chap-ann' : '');
+    row.setAttribute('role', 'menuitem');
     const t = document.createElement('span');
     t.className = 'sp-chap-t';
-    t.textContent = fmtClock(m.t);
+    t.textContent = fmtClock(m.time);
     row.appendChild(t);
     row.appendChild(document.createTextNode(m.label || ''));
-    row.addEventListener('click', (function (at) {
-      return function (ev) { ev.stopPropagation(); self.seek(at); self.play(); };
-    })(m.t));
+    row.addEventListener('click', (function (marker) {
+      return function (ev) {
+        ev.stopPropagation();
+        const el = self.eventTarget || self.root;
+        // Cancellable marker selection (Phase 5).
+        let cancelled = false;
+        if (el && typeof CustomEvent !== 'undefined') {
+          try {
+            const ce = new CustomEvent('beecast-markerselect', {
+              detail: { marker: marker },
+              bubbles: true,
+              composed: true,
+              cancelable: true,
+            });
+            cancelled = !el.dispatchEvent(ce);
+          } catch (_) {}
+        }
+        if (cancelled) return;
+        self.seek(marker.time, 'marker');
+        self.play('marker');
+        self.toggleChapters(false);
+      };
+    })(m));
     this.chaptersEl.appendChild(row);
   }
 };
 
-// The ☰ button appears once the recording has chapters at all — markers can also arrive
-// live through append(), so this re-runs on every absorb.
-Player.prototype.syncChaptersUi = function () {
-  if (this.chapBtn) this.chapBtn.hidden = this.markers.length === 0;
-  if (this.chaptersEl && !this.chaptersEl.hidden) this.renderChapters();
+Player.prototype.syncChaptersUi = function (state) {
+  if (this.chapBtn) this.chapBtn.hidden = !(state.markers && state.markers.length);
+  if (this.chaptersEl && !this.chaptersEl.hidden) this.renderChapters(state);
 };
 
-// ---- speed menu (fixed speeds, growing UP from the bar button) --------------------------
 Player.prototype.toggleSpeedMenu = function (force) {
   if (!this.speedMenuEl) return;
   const show = force != null ? force : this.speedMenuEl.hidden;
@@ -276,11 +520,15 @@ Player.prototype.toggleSpeedMenu = function (force) {
   if (show) {
     this.renderSpeedMenu();
     this.speedMenuEl.hidden = false;
-    // Any click outside the menu dismisses it (the button's own click stops propagation).
+    if (this.speedBtn) this.speedBtn.setAttribute('aria-expanded', 'true');
     this.speedAway = function () { self.toggleSpeedMenu(false); };
     document.addEventListener('click', this.speedAway);
   } else {
     this.speedMenuEl.hidden = true;
+    if (this.speedBtn) {
+      this.speedBtn.setAttribute('aria-expanded', 'false');
+      try { this.speedBtn.focus({ preventScroll: true }); } catch (_) {}
+    }
     if (this.speedAway) { document.removeEventListener('click', this.speedAway); this.speedAway = null; }
   }
 };
@@ -288,53 +536,50 @@ Player.prototype.toggleSpeedMenu = function (force) {
 Player.prototype.renderSpeedMenu = function () {
   if (!this.speedMenuEl) return;
   const self = this;
+  const speed = this.controller.speed;
   this.speedMenuEl.innerHTML = '';
-  // Fastest at the top: the menu grows upward, so the list reads descending toward 1×.
   for (let i = SPEEDS.length - 1; i >= 0; i--) {
     const v = SPEEDS[i];
     const b = document.createElement('button');
     b.type = 'button';
-    b.className = 'sp-speedopt' + (v === this.speed ? ' sp-on' : '');
+    b.className = 'sp-speedopt' + (v === speed ? ' sp-on' : '');
+    b.setAttribute('role', 'menuitemradio');
+    b.setAttribute('aria-checked', v === speed ? 'true' : 'false');
     b.textContent = String(v).replace(/\.0$/, '') + '×';
-    b.addEventListener('click', (function (speed) {
-      return function (ev) { ev.stopPropagation(); self.setSpeed(speed); self.toggleSpeedMenu(false); };
+    b.addEventListener('click', (function (s) {
+      return function (ev) {
+        ev.stopPropagation();
+        self.setSpeed(s, 'pointer');
+        self.toggleSpeedMenu(false);
+      };
     })(v));
     this.speedMenuEl.appendChild(b);
   }
 };
 
-Player.prototype.setSpeed = function (v) {
-  if (SPEEDS.indexOf(v) < 0) return;
-  this.speed = v;
-  if (this.speedBtn) this.speedBtn.textContent = String(v).replace(/\.0$/, '') + '×';
-  if (this.speedMenuEl && !this.speedMenuEl.hidden) this.renderSpeedMenu();
-};
-
-// (Re)place the chapter ticks: their positions are percentages of the duration, so a
-// growing live recording shifts them left as it lengthens.
-Player.prototype.layoutMarkers = function () {
-  if (!this.marksEl) return;
-  this.marksEl.innerHTML = '';
-  if (!(this.cast.duration > 0)) return;
-  for (const m of this.markers) {
-    const tick = document.createElement('div');
-    tick.className = 'sp-marker';
-    tick.style.left = Math.min(100, (m.t / this.cast.duration) * 100) + '%';
-    tick.title = fmtClock(m.t) + (m.label ? ' ' + m.label : '');
-    this.marksEl.appendChild(tick);
-  }
-};
-
 Player.prototype.onKey = function (ev) {
   if (ev.metaKey || ev.ctrlKey || ev.altKey) return;
+  // Escape closes menus first.
+  if (ev.key === 'Escape') {
+    if (this.speedMenuEl && !this.speedMenuEl.hidden) {
+      this.toggleSpeedMenu(false);
+      ev.preventDefault();
+      return;
+    }
+    if (this.chaptersEl && !this.chaptersEl.hidden) {
+      this.toggleChapters(false);
+      ev.preventDefault();
+      return;
+    }
+  }
   const k = ev.key;
-  if (k === ' ') this.toggle();
-  else if (k === 'ArrowLeft') this.seek(this.getCurrentTime() - SEEK_STEP_SECS);
-  else if (k === 'ArrowRight') this.seek(this.getCurrentTime() + SEEK_STEP_SECS);
-  else if (k === '<' || k === ',') this.cycleSpeed(-1);
-  else if (k === '>' || k === '.') this.cycleSpeed(1);
-  else if (k === '[') this.jumpMarker(-1);
-  else if (k === ']') this.jumpMarker(1);
+  if (k === ' ') this.toggle('keyboard');
+  else if (k === 'ArrowLeft') this.seek(this.getCurrentTime() - SEEK_STEP_SECS, 'keyboard');
+  else if (k === 'ArrowRight') this.seek(this.getCurrentTime() + SEEK_STEP_SECS, 'keyboard');
+  else if (k === '<' || k === ',') this.controller.cycleSpeed(-1, 'keyboard');
+  else if (k === '>' || k === '.') this.controller.cycleSpeed(1, 'keyboard');
+  else if (k === '[') this.controller.jumpMarker(-1, 'keyboard');
+  else if (k === ']') this.controller.jumpMarker(1, 'keyboard');
   else if (k === 'c' || k === 'C') this.toggleChapters();
   else if (k === 'f' || k === 'F') this.toggleFullscreen();
   else return;
@@ -342,63 +587,60 @@ Player.prototype.onKey = function (ev) {
   ev.stopPropagation();
 };
 
-Player.prototype.jumpMarker = function (dir) {
-  if (!this.markers.length) return;
-  const now = this.getCurrentTime();
-  let target = null;
-  if (dir > 0) {
-    for (const m of this.markers) if (m.t > now + 0.25) { target = m.t; break; }
-  } else {
-    for (const m of this.markers) if (m.t < now - 0.25) target = m.t;
-    if (target == null) target = 0;
-  }
-  if (target != null) { this.seek(target); this.play(); }
-};
+Player.prototype.layout = function () {
+  if (!this.fit || !this.root) return;
+  const box = this.root.querySelector('.sp-screen-box');
+  if (!box || !this.screenEl) return;
+  this.screenEl.style.transform = '';
+  this.screenEl.style.marginLeft = '';
+  const rect = this.screenEl.getBoundingClientRect();
+  const naturalW = rect.width, naturalH = rect.height;
+  if (!(naturalW > 0 && naturalH > 0)) return;
 
-Player.prototype.cycleSpeed = function (dir) {
-  const i = SPEEDS.indexOf(this.speed);
-  this.setSpeed(SPEEDS[Math.min(SPEEDS.length - 1, Math.max(0, (i < 0 ? 1 : i) + dir))]);
-};
+  const fs = typeof document !== 'undefined' ? document.fullscreenElement : null;
+  const rootFs = fs === this.root;
+  const wrapFs = !!(this.fsEl && fs === this.fsEl);
+  const bar = this.root.querySelector('.sp-bar');
+  const barH = bar ? Math.max(bar.offsetHeight, Math.ceil(bar.getBoundingClientRect().height)) : 0;
 
-// Apply events so that exactly those with recording time <= t are in the terminal.
-// Forward from the current position when possible; a backward seek replays from zero
-// (the recording is local text — replay is cheap and always exact).
-Player.prototype.applyEventsUpTo = function (t) {
-  const evs = this.cast.events;
-  if (this.eventIdx > 0 && evs[this.eventIdx - 1].t > t) {
-    this.term = new VT.Term(this.cast.cols, this.cast.rows);
-    this.eventIdx = 0;
+  // Width budget: the screen pane, falling back to the mount/fullscreen host.
+  let availW = box.clientWidth;
+  if (!(availW > 0)) {
+    const host = rootFs ? this.root : (wrapFs ? this.fsEl : this.root.parentNode);
+    availW = host ? host.clientWidth : 0;
   }
-  let applied = false;
-  while (this.eventIdx < evs.length && evs[this.eventIdx].t <= t) {
-    const ev = evs[this.eventIdx++];
-    if (ev.type === 'o') this.term.write(ev.data);
-    else if (ev.type === 'r') {
-      const m = /^(\d+)x(\d+)$/.exec(ev.data.trim());
-      if (m) { this.term.resize(Number(m[1]), Number(m[2])); this.layoutPending = true; }
+  let scale = availW > 0 && naturalW > availW ? availW / naturalW : 1;
+
+  if (this.fit === 'both') {
+    let availH = 0;
+    if (rootFs) {
+      // Bar is flex-pinned to the bottom; terminal gets everything above it.
+      availH = this.root.clientHeight - barH;
+    } else if (wrapFs && this.fsEl) {
+      availH = this.fsEl.clientHeight - barH;
+    } else if (this.root.parentNode) {
+      availH = this.root.parentNode.clientHeight - barH;
     }
-    applied = true;
+    // A few px of slack avoids subpixel overflow that used to clip the bar (and the
+    // speed control) under overflow:hidden.
+    if (availH > 40 && naturalH * scale > availH - 4) {
+      scale = Math.min(scale, (availH - 4) / naturalH);
+    }
   }
-  return applied;
+
+  const displayH = naturalH * scale;
+  const displayW = naturalW * scale;
+  this.screenEl.style.transform = scale < 1 ? 'scale(' + scale + ')' : '';
+  // The layout box must match the DISPLAY size: scale() does not shrink layout, and a
+  // taller box was what pushed the control bar off-screen in fullscreen.
+  box.style.height = displayH + 'px';
+  const paneW = box.clientWidth || availW;
+  this.screenEl.style.marginLeft = paneW > displayW ? (paneW - displayW) / 2 + 'px' : '';
 };
 
-Player.prototype.render = function () {
-  this.screenEl.innerHTML = screenHtml(this.term.snapshot());
-  this.renderBar();
-  if (this.layoutPending) { this.layoutPending = false; this.layout(); }
-};
-
-// The control bar alone — cheap enough for every live append even when the screen is not moving.
-Player.prototype.renderBar = function () {
-  const t = this.getCurrentTime();
-  if (this.timeEl) this.timeEl.textContent = fmtClock(t);
-  if (this.fillEl) this.fillEl.style.width = (this.cast.duration > 0 ? Math.min(100, (t / this.cast.duration) * 100) : 0) + '%';
-};
-
-// Toggle fullscreen on the embedder-supplied wrapper (fullscreenEl) or the player itself.
-// Bound to the ⛶ bar button and the `f` key; a no-op where the Fullscreen API is absent.
 Player.prototype.toggleFullscreen = function () {
   const el = this.fsEl || this.root;
+  if (!el) return;
   if (document.fullscreenElement === el) {
     if (document.exitFullscreen) document.exitFullscreen();
   } else if (el.requestFullscreen) {
@@ -406,120 +648,209 @@ Player.prototype.toggleFullscreen = function () {
   }
 };
 
-// fit: scale the fixed-metric terminal down (never up) to the containing box's width —
-// and, for fit:'both', also to the mount's height when the embedding page gives it one
-// (a definite flex/viewport height; a content-sized mount never shrinks the terminal).
-Player.prototype.layout = function () {
-  if (!this.fit) return;
-  const box = this.root.querySelector('.sp-screen-box');
-  this.screenEl.style.transform = '';
-  const rect = this.screenEl.getBoundingClientRect();
-  const naturalW = rect.width, naturalH = rect.height;
-  if (!(naturalW > 0 && naturalH > 0)) return;
-  const availW = box.clientWidth;
-  let scale = availW > 0 && naturalW > availW ? availW / naturalW : 1;
-  if (this.fit === 'both' && this.root.parentNode) {
-    const bar = this.root.querySelector('.sp-bar');
-    // A fullscreened root answers to the viewport, not to the (now-behind) mount.
-    const holder = document.fullscreenElement === this.root ? this.root : this.root.parentNode;
-    const availH = holder.clientHeight - (bar ? bar.offsetHeight : 0);
-    // The 2px slack keeps a content-sized mount (whose height IS the terminal's) stable.
-    if (availH > 40 && naturalH * scale > availH + 2) scale = Math.min(scale, availH / naturalH);
-  }
-  this.screenEl.style.transform = scale < 1 ? 'scale(' + scale + ')' : '';
-  box.style.height = naturalH * scale + 'px';
-  // Center the (possibly scaled) terminal in the pane; the layout box keeps its unscaled
-  // width, so flex centering would be off — compute the margin from the DISPLAY width.
-  const displayW = naturalW * scale;
-  this.screenEl.style.marginLeft = availW > displayW ? (availW - displayW) / 2 + 'px' : '';
+Player.prototype.play = function (origin) { this.controller.play(origin); };
+Player.prototype.pause = function (origin) { this.controller.pause(origin); };
+Player.prototype.toggle = function (origin) { this.controller.toggle(origin); };
+Player.prototype.seek = function (t, origin) {
+  this.controller.seek(t, { origin: origin || 'api' });
 };
-
-Player.prototype.tick = function (nowMs) {
-  if (this.disposed || !this.playing) return;
-  const dt = this.lastTick == null ? 0 : (nowMs - this.lastTick) / 1000;
-  this.lastTick = nowMs;
-  this.pacedPos = Math.min(this.pacing.pacedDuration, this.pacedPos + dt * this.speed);
-  const changed = this.applyEventsUpTo(this.getCurrentTime());
-  if (changed || this.timeEl) this.render();
-  if (this.pacedPos >= this.pacing.pacedDuration) { this.pause(); return; }
-  const self = this;
-  this.raf = requestAnimationFrame(function (ts) { self.tick(ts); });
-};
-
-Player.prototype.play = function () {
-  if (this.disposed || this.playing) return;
-  if (this.pacedPos >= this.pacing.pacedDuration) this.pacedPos = 0; // replay from the top
-  this.playing = true;
-  this.lastTick = null;
-  if (this.playBtn) this.playBtn.textContent = '⏸';
-  this.syncOverlay();
-  const self = this;
-  this.raf = requestAnimationFrame(function (ts) { self.tick(ts); });
-};
-
-Player.prototype.pause = function () {
-  this.playing = false;
-  if (this.raf != null) { cancelAnimationFrame(this.raf); this.raf = null; }
-  if (this.playBtn) this.playBtn.textContent = '▶';
-  this.syncOverlay();
-};
-
-Player.prototype.toggle = function () { if (this.playing) this.pause(); else this.play(); };
-
-Player.prototype.seek = function (t) {
-  t = Math.min(this.cast.duration, Math.max(0, parseTime(t)));
-  this.pacedPos = VT.mapTime(this.pacing.rec, this.pacing.paced, t);
-  this.applyEventsUpTo(t);
-  this.render();
-  this.syncOverlay();
-};
-
-Player.prototype.getCurrentTime = function () {
-  return VT.mapTime(this.pacing.paced, this.pacing.rec, this.pacedPos);
-};
-
-// Live-follow: feed newly produced cast lines (v2/v3 NDJSON) into a mounted player as the
-// recording grows — how the data arrives (WebSocket, polling, a tailed file) is the
-// caller's business. Chunk boundaries are free; a partial trailing line is buffered until
-// its remainder arrives. The follow policy is positional, like `tail -f`: a playhead
-// resting at the live edge stays pinned to it and renders each append immediately, while a
-// viewer who paused earlier or seeked back is never yanked forward — they just watch the
-// duration grow. A *playing* player keeps its own clock; the longer recording simply no
-// longer auto-pauses it at the old end (and once playback catches the edge and parks,
-// subsequent appends pick it up and follow).
-Player.prototype.append = function (text) {
-  if (this.disposed) return;
-  const atEdge = !this.playing && this.pacedPos >= this.pacing.pacedDuration - 1e-9;
-  const fromIdx = this.cast.events.length;
-  const prevDuration = this.cast.duration;
-  VT.appendCast(this.cast, text);
-  if (this.cast.events.length === fromIdx && this.cast.duration === prevDuration) return;
-  VT.extendPacing(this.pacing, this.cast.events, fromIdx, this.cast.duration);
-  this.absorbMarkers(fromIdx);
-  if (this.durEl) this.durEl.textContent = fmtClock(this.cast.duration);
-  this.layoutMarkers();
-  this.syncChaptersUi();
-  if (atEdge) {
-    this.pacedPos = this.pacing.pacedDuration;
-    this.applyEventsUpTo(this.getCurrentTime());
-    this.render();
-  } else {
-    this.renderBar(); // same playhead, longer recording: only the bar's proportions move
-  }
-  this.syncOverlay();
-};
+Player.prototype.setSpeed = function (v, origin) { this.controller.setSpeed(v, origin); };
+Player.prototype.getCurrentTime = function () { return this.controller.getCurrentTime(); };
+Player.prototype.getState = function () { return this.controller.getState(); };
+Player.prototype.append = function (text) { this.controller.append(text); };
+Player.prototype.subscribe = function (fn) { return this.controller.subscribe(fn); };
 
 Player.prototype.dispose = function () {
+  if (this.disposed) return;
   this.disposed = true;
-  this.pause();
+  if (this.unsubscribe) { this.unsubscribe(); this.unsubscribe = null; }
+  this.controller.dispose();
   if (this.speedAway) { document.removeEventListener('click', this.speedAway); this.speedAway = null; }
   if (this.resizeObs) { try { this.resizeObs.disconnect(); } catch (_) {} this.resizeObs = null; }
-  if (this.fsHandler) { document.removeEventListener('fullscreenchange', this.fsHandler); this.fsHandler = null; }
+  if (this.fsHandler) {
+    try { document.removeEventListener('fullscreenchange', this.fsHandler); } catch (_) {}
+    this.fsHandler = null;
+  }
   if (this.root && this.root.parentNode) this.root.parentNode.removeChild(this.root);
+  this.root = null;
 };
 
+// ---- Web Component ---------------------------------------------------------------------
+// Preferred browser integration. Light DOM so the embedding page's inlined PLAYER_CSS
+// styles the controls (Shadow DOM would require shipping CSS inside the JS bundle).
+// part attributes mark stable styling hooks for when an open shadow root is added later.
+function registerComponent() {
+  if (typeof customElements === 'undefined' || typeof HTMLElement === 'undefined') return;
+  if (customElements.get('beecast-player')) return;
+
+  class BeeCastPlayerElement extends HTMLElement {
+    static get observedAttributes() {
+      // Only the attributes that are live after mount; the rest are read at mount time.
+      return ['fit', 'speed', 'theme'];
+    }
+
+    constructor() {
+      super();
+      this._player = null;
+      this._pending = {};
+      this._connected = false;
+    }
+
+    connectedCallback() {
+      this._connected = true;
+      this.style.display = this.style.display || 'block';
+      if (!this._player) this._mountPlayer();
+    }
+
+    disconnectedCallback() {
+      this._connected = false;
+      if (this._player) {
+        this._player.dispose();
+        this._player = null;
+      }
+    }
+
+    attributeChangedCallback(name, oldV, newV) {
+      if (oldV === newV || !this._player) return;
+      if (name === 'speed') this._player.setSpeed(Number(newV) || 1);
+      if (name === 'fit') { this._player.fit = newV || null; this._player.layout(); }
+      if (name === 'theme' && this._player.root) {
+        if (newV) this._player.root.setAttribute('data-theme', newV);
+        else this._player.root.removeAttribute('data-theme');
+      }
+    }
+
+    _optsFromAttributes() {
+      const opts = {};
+      if (this.hasAttribute('fit')) opts.fit = this.getAttribute('fit');
+      if (this.hasAttribute('autoplay')) opts.autoPlay = this.getAttribute('autoplay') !== 'false';
+      if (this.hasAttribute('idle-time-limit')) {
+        opts.idleTimeLimit = Number(this.getAttribute('idle-time-limit'));
+      }
+      if (this.hasAttribute('speed')) opts.speed = Number(this.getAttribute('speed'));
+      if (this.hasAttribute('start-at')) opts.startAt = this.getAttribute('start-at');
+      if (this.hasAttribute('controls')) {
+        opts.controls = this.getAttribute('controls') === 'false' ? false : true;
+      }
+      if (this.hasAttribute('accessibility')) {
+        opts.accessibility = this.getAttribute('accessibility');
+      }
+      if (this._pending.markers) opts.markers = this._pending.markers;
+      if (this._pending.speed != null) opts.speed = this._pending.speed;
+      if (this._pending.startAt != null) opts.startAt = this._pending.startAt;
+      if (this._pending.fit != null) opts.fit = this._pending.fit;
+      if (this._pending.controls != null) opts.controls = this._pending.controls;
+      if (this._pending.autoPlay != null) opts.autoPlay = this._pending.autoPlay;
+      if (this._pending.idleTimeLimit != null) opts.idleTimeLimit = this._pending.idleTimeLimit;
+      if (this._pending.fullscreenEl) opts.fullscreenEl = this._pending.fullscreenEl;
+      if (this._pending.clock) opts.clock = this._pending.clock;
+      if (this._pending.accessibility) opts.accessibility = this._pending.accessibility;
+      return opts;
+    }
+
+    _mountPlayer() {
+      while (this.firstChild) this.removeChild(this.firstChild);
+      const data = this._pending.cast != null ? this._pending.cast
+        : (this._pending.data != null ? this._pending.data : '');
+      const opts = this._optsFromAttributes();
+      const player = new Player({ data: data, source: this._pending.source }, this, opts);
+      player.eventTarget = this;
+      this._player = player;
+      const theme = this.getAttribute('theme') || this._pending.theme;
+      if (theme && player.root) player.root.setAttribute('data-theme', theme);
+    }
+
+    load(opts) {
+      opts = opts || {};
+      if (opts.cast != null) this._pending.cast = opts.cast;
+      if (opts.data != null) this._pending.cast = opts.data;
+      if (opts.metadata) this._pending.metadata = opts.metadata;
+      if (opts.markers) this._pending.markers = opts.markers;
+      if (opts.source) this._pending.source = opts.source;
+      if (opts.speed != null) this._pending.speed = opts.speed;
+      if (opts.startAt != null) this._pending.startAt = opts.startAt;
+      if (opts.autoPlay != null) this._pending.autoPlay = opts.autoPlay;
+      if (!this._connected) return;
+      if (this._player) {
+        this._player.controller.load({
+          data: this._pending.cast,
+          markers: this._pending.markers,
+          startAt: this._pending.startAt,
+          autoPlay: this._pending.autoPlay,
+        });
+        if (opts.speed != null) this._player.setSpeed(opts.speed);
+      } else {
+        this._mountPlayer();
+      }
+    }
+
+    play() { if (this._player) this._player.play('api'); }
+    pause() { if (this._player) this._player.pause('api'); }
+    toggle() { if (this._player) this._player.toggle('api'); }
+    seek(t) { if (this._player) this._player.seek(t, 'api'); }
+    setSpeed(v) { if (this._player) this._player.setSpeed(v, 'api'); }
+    append(t) { if (this._player) this._player.append(t); }
+    getCurrentTime() { return this._player ? this._player.getCurrentTime() : 0; }
+    dispose() {
+      if (this._player) { this._player.dispose(); this._player = null; }
+    }
+
+    get state() { return this._player ? publicState(this._player.getState()) : null; }
+    get cast() { return this._pending.cast; }
+    set cast(v) { this._pending.cast = v; if (this._player) this.load({ cast: v }); }
+    get markers() { return this._pending.markers; }
+    set markers(v) {
+      this._pending.markers = v;
+      if (this._player) this._player.controller.setMarkers(v);
+    }
+    get speed() {
+      return this._player ? this._player.controller.speed : Number(this.getAttribute('speed')) || 1;
+    }
+    set speed(v) { this._pending.speed = v; if (this._player) this._player.setSpeed(v); }
+  }
+
+  try {
+    customElements.define('beecast-player', BeeCastPlayerElement);
+    root.BeeCastPlayerElement = BeeCastPlayerElement;
+  } catch (_) {
+    // Legacy create() still works without custom elements.
+  }
+}
+
+registerComponent();
+
+// ---- public API ------------------------------------------------------------------------
+// BeeCastPlayer.create remains the compatibility factory: a thin Player over the controller.
+// New integrations should prefer <beecast-player> or BeeCastController directly.
 root.BeeCastPlayer = {
   create: function (src, mount, opts) { return new Player(src, mount, opts); },
+  Player: Player,
+  elementName: 'beecast-player',
+  SPEEDS: SPEEDS,
+  // Documented public surface snapshot for compatibility fixtures (Phase 0).
+  publicMethods: [
+    'create', 'play', 'pause', 'toggle', 'seek', 'getCurrentTime', 'append', 'dispose',
+    'setSpeed', 'getState', 'subscribe',
+  ],
+  supportedCssVariables: [
+    '--beecast-color-surface',
+    '--beecast-color-surface-raised',
+    '--beecast-color-text',
+    '--beecast-color-text-muted',
+    '--beecast-color-accent',
+    '--beecast-color-focus',
+    '--beecast-color-marker',
+    '--beecast-color-error',
+    '--beecast-control-height',
+    '--beecast-radius',
+    '--beecast-font-ui',
+    '--beecast-font-terminal',
+    '--sp-bg', '--sp-fg',
+    '--sp-c0', '--sp-c1', '--sp-c2', '--sp-c3', '--sp-c4', '--sp-c5', '--sp-c6', '--sp-c7',
+    '--sp-c8', '--sp-c9', '--sp-c10', '--sp-c11', '--sp-c12', '--sp-c13', '--sp-c14', '--sp-c15',
+  ],
+  // Readable during migration but not public API — do not depend on these.
+  nonPublicFields: ['playing', 'pacedPos', 'eventIdx', 'cast', 'term', 'pacing', 'raf'],
 };
 
 })(typeof window !== 'undefined' ? window : globalThis);

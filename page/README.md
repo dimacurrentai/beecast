@@ -19,7 +19,7 @@ let html = build_page(&cast, &meta, "demo.cast");
 - **`inspect`** — light validation of the recording: reject a non-asciicast early with a typed `CastError`, tell v1/v2/v3 apart, and compute the total duration when that is cheap.
 - **`PageMeta`** — the borrowed plain-strings metadata shape: `title`, `summary`, and `(seconds, title)` chapter pairs.
 
-Validating the metadata (strictly ascending chapters, the first at `t = 0`) stays the caller's job: the [`beecast`](https://crates.io/crates/beecast) CLI validates through [`beecast-dto`](https://crates.io/crates/beecast-dto) and converts to plain strings at this crate's boundary. What the generated page can do — chapter navigation, 0.5×–3× speed, `?t=<seconds>&note=<comment>` deep links — is documented in the [CLI README](https://github.com/dkorolev/beecast/blob/main/cli/README.md).
+Validating the metadata (strictly ascending chapters, the first at `t = 0`) stays the caller's job: the [`beecast`](https://crates.io/crates/beecast) CLI validates through [`beecast-dto`](https://crates.io/crates/beecast-dto) and converts to plain strings at this crate's boundary. The generated page keeps title, summary, share-link notes, and layout at page level; play/pause, seek, speed, chapters, and fullscreen live entirely inside the embedded player (see [`beecast-player`](https://crates.io/crates/beecast-player)). Deep links (`?t=<seconds>&note=<comment>`) are documented in the [CLI README](https://github.com/dkorolev/beecast/blob/main/cli/README.md).
 
 ## License
 
