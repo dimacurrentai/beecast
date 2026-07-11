@@ -525,6 +525,9 @@ Player.prototype.toggleChapters = function (force, opts) {
       try { this.chapBtn.focus({ preventScroll: true }); } catch (_) {}
     }
   }
+  // A docked panel shares the stage width with the terminal: opening/closing it changes
+  // the width budget, and the mount itself does not resize (so no ResizeObserver tick).
+  if (!this._layouting) this.layout();
 };
 
 Player.prototype.renderChapters = function (state) {
@@ -798,6 +801,22 @@ Player.prototype.layout = function () {
       const host = rootFs ? this.root : (wrapFs ? this.fsEl : this.root.parentNode);
       availW = host ? host.clientWidth : 0;
     }
+    // A fullscreen host page can let max-content children blow the pane out sideways
+    // (e.g. a grid wrapper without minmax(0,1fr)): the box then measures wider than the
+    // screen itself and no horizontal scale is applied. In fullscreen nothing may budget
+    // wider than the fullscreen element, minus a visible docked chapter panel.
+    const fsHost = rootFs ? this.root : (wrapFs ? this.fsEl : null);
+    let fsCap = 0;
+    if (fsHost && fsHost.clientWidth > 0) {
+      let cap = fsHost.clientWidth;
+      if (this.root.classList.contains('sp-chapters-dock') && this.chaptersEl && !this.chaptersEl.hidden) {
+        cap -= this.chaptersEl.offsetWidth;
+      }
+      if (cap > 40) {
+        fsCap = cap;
+        availW = availW > 0 ? Math.min(availW, cap) : cap;
+      }
+    }
     let scale = availW > 0 && naturalW > availW ? availW / naturalW : 1;
 
     // fit:'both' honors a definite mount height only. Fullscreen hosts are definite by
@@ -838,7 +857,10 @@ Player.prototype.layout = function () {
     const displayW = naturalW * scale;
     const transform = scale < 1 ? 'scale(' + scale + ')' : '';
     const height = displayH + 'px';
-    const paneW = box.clientWidth || availW;
+    // Center within the VISIBLE pane: on a host that lets the pane overflow the
+    // fullscreen element, box.clientWidth is a lie and would center off-screen.
+    let paneW = box.clientWidth || availW;
+    if (fsCap > 0) paneW = Math.min(paneW, fsCap);
     const margin = paneW > displayW ? (paneW - displayW) / 2 + 'px' : '';
     // Idempotent: skip style writes that would only re-arm ResizeObserver.
     if (this._layoutScale === scale && this.screenEl.style.transform === transform &&
