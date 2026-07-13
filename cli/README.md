@@ -10,6 +10,7 @@ open demo.html                     # play it — fully offline
 ## What the page gives you
 
 - **Playback** of asciicast v1, v2, and v3 recordings, via beecast's own inlined clean-room player (MIT, like everything else here).
+- **One deliberate look** — the page is dark-only by design, matched to the player's default terminal palette; there is no light theme and none is planned. (The [`beecast-player`](../player) crate itself supports light/system themes for other embedders.)
 - **Title and summary** — rendered from the optional metadata sidecar (see below).
 - **Chapter navigation** — one button per chapter, plus markers on the player timeline.
 - **Speed up / slow down** — 0.5× · 1× · 1.5× · 2× · 3×, switchable mid-playback.
