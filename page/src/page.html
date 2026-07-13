@@ -9,6 +9,9 @@
 @@BEECAST_PLAYER_CSS@@
 </style>
 <style>
+/* Deliberately dark-only: one canonical look for every generated page, matched to the
+   player's default terminal palette. The embedded player supports data-theme
+   light/system for other embedders; this page intentionally does not expose them. */
 :root { color-scheme: dark; }
 * { box-sizing: border-box; }
 /* `height` (not `min-height`): the flex chain must be definite, or the percentage heights
